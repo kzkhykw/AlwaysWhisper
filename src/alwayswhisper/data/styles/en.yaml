@@ -1,0 +1,34 @@
+position:
+  align: "center_bottom"
+  margin_bottom: 60
+
+background:
+  color: [0, 0, 0, 200]
+  corner_radius: 12
+  padding: 16
+
+text:
+  color: "#FFFFFF"
+  font_family:
+    # macOS
+    - "/System/Library/Fonts/HelveticaNeue.ttc"
+    - "/System/Library/Fonts/Helvetica.ttc"
+    - "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+    # Linux
+    - "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    - "DejaVu Sans Bold"
+    # Windows
+    - "C:/Windows/Fonts/arialbd.ttf"
+    - "Arial"
+    - "Helvetica"
+  font_size: 44
+  font_weight: "bold"
+
+shadow:
+  enabled: true
+  offset: [2, 2]
+  color: "#333333"
+
+animation:
+  type: "typewriter"
+  completion_ms: 400

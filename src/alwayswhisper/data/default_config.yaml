@@ -1,0 +1,22 @@
+transcribe:
+  backend: faster-whisper  # or: openai-api
+  model: large-v3          # faster-whisper model name; openai-api backend always uses whisper-1
+  device: auto
+  compute_type: auto
+  language: ja
+  prompt: null              # optional bias prompt (or use --glossary FILE)
+  prompt_max_tokens: 224
+  strip_phrases: null       # null = built-in Japanese hallucination phrases when language is ja; [] disables; list replaces
+srt:
+  max_chars: null  # null = 42 (en) / 35 (ja); 21 recommended for one-line Japanese captions
+  min_chars: 4
+caption:
+  style: null        # null = packaged default style
+  fast_mode: false    # true = libass/ffmpeg burn-in (fast, needs libass-enabled ffmpeg)
+  realign: false       # snap SRT starts to word timestamps (only useful after external timestamp drift)
+qa:
+  enabled: true
+  samples: 5
+  min_ratio: 0.5
+  pad_ms: 300
+  min_entry_ms: 500

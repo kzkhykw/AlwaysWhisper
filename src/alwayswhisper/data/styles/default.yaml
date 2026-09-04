@@ -1,0 +1,37 @@
+position:
+  align: "center_bottom"
+  margin_bottom: 60
+
+background:
+  color: [0, 0, 0, 200]
+  corner_radius: 12
+  padding: 16
+
+text:
+  color: "#FFFFFF"
+  font_family:
+    # macOS
+    - "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc"
+    - "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc"
+    - "Hiragino Sans"
+    # Linux
+    - "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
+    - "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+    - "NotoSansCJK-Bold"
+    - "Noto Sans CJK JP"
+    # Windows
+    - "C:/Windows/Fonts/YuGothB.ttc"
+    - "C:/Windows/Fonts/meiryob.ttc"
+    - "Yu Gothic"
+    - "Meiryo"
+  font_size: 64
+  font_weight: "bold"
+
+shadow:
+  enabled: true
+  offset: [2, 2]
+  color: "#333333"
+
+animation:
+  type: "typewriter"
+  completion_ms: 400

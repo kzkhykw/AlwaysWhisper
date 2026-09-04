@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "alwayswhisper"
+version = "0.1.0"
+description = "Local-Whisper transcription and stylish burned-in captions (word-level timestamps, Japanese-optimized segmentation, typewriter effect, automatic AV QA)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "kzkhykw", email = "support@pmdao.org" },
+]
+keywords = [
+    "whisper",
+    "transcription",
+    "captions",
+    "subtitles",
+    "srt",
+    "japanese",
+    "video",
+    "ffmpeg",
+    "asr",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Text Processing :: Linguistic",
+]
+dependencies = [
+    "faster-whisper>=1.0",
+    "PyYAML>=6.0",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+    "moviepy>=2.0",
+]
+
+[project.optional-dependencies]
+api = ["openai>=1.0", "pydub>=0.25.1", "python-dotenv>=1.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+alwayswhisper = "alwayswhisper.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/kzkhykw/AlwaysWhisper"
+Repository = "https://github.com/kzkhykw/AlwaysWhisper"
+Issues = "https://github.com/kzkhykw/AlwaysWhisper/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alwayswhisper"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
