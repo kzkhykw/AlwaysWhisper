@@ -1,5 +1,9 @@
 # AlwaysWhisper
 
+[![Live captions in the MacBook notch, with copy and translation](docs/assets/live-captions-demo.gif)](docs/assets/live-captions-demo.mp4)
+
+Live captions, copy, and translation — [watch the demo with sound](docs/assets/live-captions-demo.mp4).
+
 [日本語版はこちら (README.ja.md)](README.ja.md)
 
 AlwaysWhisper takes a video or audio file and hands you back two things: the
