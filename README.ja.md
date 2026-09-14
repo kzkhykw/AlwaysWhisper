@@ -1,5 +1,9 @@
 # AlwaysWhisper
 
+[![MacBookのノッチ内で動くライブ字幕・コピー・翻訳のデモ](docs/assets/live-captions-demo.gif)](docs/assets/live-captions-demo.mp4)
+
+ライブ字幕・コピー・翻訳のデモです。[音声付き動画を見る](docs/assets/live-captions-demo.mp4)。
+
 [English README is here (README.md)](README.md)
 
 **AlwaysWhisper** は、動画や音声ファイルを入れると、字幕(キャプション)を焼き込んだ動画と、字幕のテキストファイルを作ってくれる道具です。文字起こし(音声を聞き取って文字にすること)には Whisper(OpenAIが作った音声認識の仕組み)を使いますが、標準の文字起こしはあなた自身のパソコンの中で動きます。音声データをインターネット越しにどこかへ送る必要はありません。
