@@ -10,7 +10,10 @@ exactly when each word happens, splits that into caption-sized lines, and
 draws them onto the video for you. Everything runs **on your own computer**
 — no video or audio leaves your machine, unless you deliberately switch on
 the optional hosted backend (running the model on someone else's server
-instead of yours) described below.
+instead of yours) described below. Live microphone captions are also available
+on Apple Silicon Macs in a notch-integrated Dynamic Island. Optional caption
+translation sends the selected text to OpenRouter; see
+[Live microphone captions](#live-microphone-captions-on-macos) for setup.
 
 ## What it does, in plain words
 
@@ -34,7 +37,7 @@ instead of yours) described below.
   the video so you can look into it.
 - **Runs on your own computer by default** — no account, no API key (a
   secret password for a paid service), and nothing sent over the internet,
-  unless you turn on the optional hosted OpenAI backend yourself.
+  unless you use the optional hosted OpenAI backend or caption translation.
 
 ## Words you will see
 
@@ -1057,3 +1060,79 @@ part of a paid product or service — needs to buy a commercial license
 first.
 
 Required Notice: Copyright (c) 2026 kzkhykw (support@pmdao.org)
+
+## Live microphone captions on macOS
+
+On Apple Silicon Macs, install the optional live dependencies and start:
+
+```bash
+pip install 'alwayswhisper[live] @ git+https://github.com/kzkhykw/AlwaysWhisper.git'
+alwayswhisper live
+```
+
+The first run downloads the MLX Whisper model (about 3 GB). Allow microphone
+access for the terminal/app when macOS prompts. Microphone transcription runs
+locally; the optional translation action described below uses an external API.
+File transcription and video burn-in commands keep their existing behavior.
+
+Live captions are enabled by default. The default **Dynamic Island** is a
+single black surface joined to the MacBook's notch: it expands for captions,
+keeps the text centered when action icons appear, and collapses after five
+seconds without new caption text. The right-hand meter follows real microphone
+RMS volume at 30 updates/second. The caption area has 2 physical pixels of top
+padding and 4 at the bottom, including on Retina screens.
+
+```bash
+alwayswhisper live --captions-position free    # legacy draggable overlay
+alwayswhisper live --captions-position bottom  # reset free placement to bottom-center
+alwayswhisper live --captions-position dynamic-island
+alwayswhisper live --no-captions               # terminal + transcript files only
+alwayswhisper live --list-devices
+alwayswhisper live --device 3 --language en
+alwayswhisper live --demo                     # no microphone/model; meter stays idle
+```
+
+`notch` is also accepted as an alias for the island. The notched screen is
+preferred when an external display is attached; without a notch the island
+sits below the menu bar. Hover to read recent history, scroll to browse older
+captions, and use Command-scroll or the resize handle to change text size.
+Click the island to keep it open, and click × to collapse it. The legacy `free`
+mode remains draggable. Position and font size are saved in
+`~/.config/alwayswhisper/caption_overlay.json`; an explicit placement flag wins
+over the saved setting. Reduced Motion disables the open/close morph.
+
+Transcripts are saved under
+`~/Library/Application Support/AlwaysWhisper/transcripts/` as daily Markdown
+and per-session JSONL. Override this with `--transcript-dir PATH`, and stop with
+Ctrl-C to finish writing. `alwayswhisper-live` is an equivalent standalone
+entry point. Live microphone ASR requires Apple Silicon; file-based commands
+remain cross-platform.
+
+### Optional translation: OpenRouter API
+
+Copying captions and local transcription need **no API key**. The translation
+icon calls **OpenRouter**, sending the selected caption text (not microphone
+audio) to the configured model and copying the translation to your clipboard.
+Japanese text translates to English; other text translates to Japanese.
+Clicking the translation icon, or resting on it for 0.5 seconds, starts a request.
+
+1. Create an API key in [OpenRouter's key settings](https://openrouter.ai/settings/keys).
+2. Add credits as needed. Translation requests use the selected model's token
+   pricing and deduct credits; see [OpenRouter billing](https://openrouter.ai/docs/faq).
+3. Set the key before starting the app:
+
+```bash
+export OPENROUTER_API_KEY='your-api-key'
+alwayswhisper live
+```
+
+You can also put `OPENROUTER_API_KEY=your-api-key` in a `.env` file in the
+working directory from which you launch AlwaysWhisper. Environment variables
+win over `.env`. Keep that file and your real key out of version control.
+The default model is `google/gemini-2.5-flash-lite`; override it with
+`OPENROUTER_TRANSLATE_MODEL`. `OPENROUTER_API_URL` changes the endpoint (default
+`https://openrouter.ai/api/v1/chat/completions`). See the
+[OpenRouter API quickstart](https://openrouter.ai/docs/quickstart).
+
+With no key, ordinary captions and copying still work; attempting translation
+shows an error in the terminal. Failed requests do not interrupt transcription.

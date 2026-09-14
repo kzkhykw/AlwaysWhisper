@@ -2,7 +2,9 @@
 
 [English README is here (README.md)](README.md)
 
-**AlwaysWhisper** は、動画や音声ファイルを入れると、字幕(キャプション)を焼き込んだ動画と、字幕のテキストファイルを作ってくれる道具です。文字起こし(音声を聞き取って文字にすること)には Whisper(OpenAIが作った音声認識の仕組み)を使いますが、すべてあなた自身のパソコンの中だけで動きます。音声データをインターネット越しにどこかへ送る必要はありません。
+**AlwaysWhisper** は、動画や音声ファイルを入れると、字幕(キャプション)を焼き込んだ動画と、字幕のテキストファイルを作ってくれる道具です。文字起こし(音声を聞き取って文字にすること)には Whisper(OpenAIが作った音声認識の仕組み)を使いますが、標準の文字起こしはあなた自身のパソコンの中で動きます。音声データをインターネット越しにどこかへ送る必要はありません。
+
+Apple Silicon Macでは、ノッチと一体化したDynamic Islandにマイクのライブ字幕も表示できます。翻訳機能は選択した字幕テキストをOpenRouter APIへ送信します。設定方法は[ライブ字幕の説明](#macosでライブ字幕を表示する)をご覧ください。
 
 具体的には、聞き取った内容を日本語の文法に合わせて字幕向けの短い行に分割し、タイプライターのように1文字ずつ表示されていく演出をつけて動画に焼き込みます。焼き込む前には、できあがった字幕をもう一度音声と照らし合わせて確認する自動チェック(QA)が走るので、字幕がズレたまま完成してしまうことを防げます。単語ごとの正確な発話タイミング(「word-level timestamps」= どの単語が何秒何コマ目に話されたかという情報)は、文字起こしから字幕の分割、(使う場合は)タイミングの再調整まで、パイプライン(一連の処理の流れ)を通してずっと保持されます。
 
@@ -48,7 +50,7 @@
 ## 必要なもの
 
 - **Python 3.10以上** — AlwaysWhisper自体がPythonで書かれたプログラムなので、動かすためのPython本体が必要です。
-- **ffmpeg** — 動画・音声ファイルを読み書きする無料のツールです([この説明で出てくる言葉](#この説明で出てくる言葉)を参照)。今のところ、動画や音声を扱うAlwaysWhisperのすべてのコマンドで必要になります。`transcribe`/`auto` は文字起こしの前にffmpegで音声だけをWAVファイルとして取り出しますし、`caption`/`qa` はQA(答え合わせ)用の音声クリップを切り出したり、標準モード(後述の`--fast`を使わない方)では焼き込み後の動画に元の音声トラックを戻したりするのにffmpegを使います。(faster-whisper自体はPyAV(Pythonから動画・音声データを直接読み書きするためのライブラリ)経由でffmpegなしに音声を直接読み込めますが、AlwaysWhisper側の音声抽出処理は今のところその機能を使っていないため、どちらのバックエンドを選んでもffmpegのインストールが前提になります。)
+- **ffmpeg** — 動画・音声ファイルを読み書きする無料のツールです([この説明で出てくる言葉](#この説明で出てくる言葉)を参照)。ファイル文字起こし・動画焼き込みで必要です（`live` には不要です）。`transcribe`/`auto` は文字起こしの前にffmpegで音声だけをWAVファイルとして取り出しますし、`caption`/`qa` はQA(答え合わせ)用の音声クリップを切り出したり、標準モード(後述の`--fast`を使わない方)では焼き込み後の動画に元の音声トラックを戻したりするのにffmpegを使います。(faster-whisper自体はPyAV(Pythonから動画・音声データを直接読み書きするためのライブラリ)経由でffmpegなしに音声を直接読み込めますが、AlwaysWhisper側の音声抽出処理は今のところその機能を使っていないため、どちらのバックエンドを選んでもffmpegのインストールが前提になります。)
 - **高速焼き込みモード(`--fast`)を使う場合は、libass対応のffmpeg** — 字幕を高速に焼き込む `--fast` モードは、`ass` という字幕フィルタを使うため、通常のffmpegでは動きません。「libass」という字幕描画の部品を組み込んだffmpegが別途必要です。
   - **macOS**: Homebrew(macOS用のパッケージ管理ツール)の通常の `ffmpeg` はlibassが無効になっているため、代わりに `brew install ffmpeg-full` でインストールしてください。`/opt/homebrew/opt/ffmpeg-full/bin`(Apple Silicon = M1/M2などのMac)と `/usr/local/opt/ffmpeg-full/bin`(Intel Mac)は自動的に検出されます。環境変数 `FFMPEG_LIBASS_BIN`(および `FFPROBE_LIBASS_BIN`)で、libass対応バイナリの場所を直接指定することもできます。
   - **Debian/Ubuntu**: `apt install ffmpeg` で入るふつうのffmpegに、通常すでにlibassが含まれています。
@@ -661,3 +663,72 @@ AlwaysWhisperは [PolyForm Noncommercial License 1.0.0](https://polyformproject.
 Required Notice: Copyright (c) 2026 kzkhykw (support@pmdao.org)
 
 かんたんに言うと、趣味で自分の動画に字幕を付けたり、学校の課題や研究に使ったりする分には無料で自由に使えますが、会社の仕事として使ったり、この道具を使ったサービスでお金を稼いだりする場合は、商用ライセンスの契約が別途必要になる、ということです。
+
+## macOSでライブ字幕を表示する
+
+Apple Silicon Macで、ライブ字幕用の追加パッケージをインストールして起動します。
+
+```bash
+pip install 'alwayswhisper[live] @ git+https://github.com/kzkhykw/AlwaysWhisper.git'
+alwayswhisper live
+```
+
+初回はMLX Whisperモデル（約3GB）をダウンロードします。macOSから求められたら、
+起動したターミナル／アプリのマイク使用を許可してください。文字起こしはローカルで
+実行します。後述の翻訳操作には外部APIを使います。
+
+デフォルトはノッチと一体化した **Dynamic Island表示** です。同じ黒い領域が字幕に
+合わせて広がり、字幕更新が5秒途切れると縮みます。右側はマイクの実測RMS音量を
+毎秒30回更新するバーです。字幕は中央揃えで、コピー／翻訳アイコンの表示時も
+位置がずれません。字幕エリアの余白は上2px・下4px（Retinaの実ピクセル基準）です。
+
+```bash
+alwayswhisper live --captions-position free    # 旧モード：画面上の自由な位置にドラッグ
+alwayswhisper live --captions-position bottom  # 自由配置を画面下中央に戻す
+alwayswhisper live --captions-position dynamic-island
+alwayswhisper live --no-captions               # 画面表示なし、端末とファイルへの文字起こし
+alwayswhisper live --list-devices
+alwayswhisper live --device 3 --language ja
+alwayswhisper live --demo                     # マイク／モデル不要の表示確認
+```
+
+`notch` 指定もDynamic Islandと同じ表示です。ノッチ付き画面を優先し、ノッチがない
+場合はメニューバー下に表示します。ホバーで履歴を展開し、スクロールで過去の字幕を
+読み返せます。Command＋スクロールまたは右上のハンドルで文字サイズを変更できます。
+島をクリックすると表示を固定し、左上の×をクリックすると固定解除・縮小します。
+旧 `free` モードは引き続きドラッグで移動できます。
+
+位置と文字サイズは `~/.config/alwayswhisper/caption_overlay.json` に保存します。
+明示した表示位置オプションは保存済み設定より優先します。「視差効果を減らす」が
+有効な場合は開閉アニメーションを省略します。
+
+文字起こしは `~/Library/Application Support/AlwaysWhisper/transcripts/` に日別Markdownと
+セッション別JSONLで保存します。`--transcript-dir PATH` で変更できます。停止はCtrl-Cです。
+`alwayswhisper-live` でも同じ機能を起動できます。ライブ音声認識はApple Siliconが必要です。
+既存のファイル文字起こし・動画字幕焼き込みコマンドもそのまま使えます。
+
+### 翻訳機能はOpenRouter APIを使用します
+
+**ローカル文字起こしと字幕のコピーにはAPIキーは不要です。** 翻訳アイコンを操作したときは、
+選んだ字幕のテキストをOpenRouter経由で設定モデルへ送信し、訳文をクリップボードへコピーします。
+マイク音声はこの翻訳リクエストには含みません。日本語は英語へ、それ以外は日本語へ翻訳します。
+アイコンをクリックするか、0.5秒間カーソルを乗せると翻訳リクエストが実行されます。
+
+1. [OpenRouterのキー設定](https://openrouter.ai/settings/keys) でAPIキーを発行します。
+2. 必要なクレジットを購入します。翻訳の利用料金はモデルのトークン単価に応じて発生し、
+   クレジットから差し引かれます。[料金・請求の説明](https://openrouter.ai/docs/faq)
+3. 起動前にキーを設定します。
+
+```bash
+export OPENROUTER_API_KEY='your-api-key'
+alwayswhisper live
+```
+
+起動する作業ディレクトリの `.env` に `OPENROUTER_API_KEY=your-api-key` を書く方法も使えます。
+環境変数を優先します。実際のキーや `.env` はGitへコミットしないでください。
+既定モデルは `google/gemini-2.5-flash-lite` で、`OPENROUTER_TRANSLATE_MODEL` で変更できます。
+API送信先は `OPENROUTER_API_URL`（既定 `https://openrouter.ai/api/v1/chat/completions`）です。
+[OpenRouter APIの利用手順](https://openrouter.ai/docs/quickstart)
+
+キーがなくても通常の字幕・コピーは使えます。翻訳を試すと端末に設定案内が表示されます。
+APIエラーが起きても文字起こしは継続します。マイクを使わない `--demo` の音量バーは無音表示です。

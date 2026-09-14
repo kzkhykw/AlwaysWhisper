@@ -343,6 +343,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default="large-v3", help="Model name to download (default: large-v3).")
     p.set_defaults(func=cmd_prefetch)
 
+    from .live.cli import configure_parser as configure_live_parser
+    configure_live_parser(subparsers.add_parser("live", help="Live microphone captions on macOS."))
+
     return parser
 
 
