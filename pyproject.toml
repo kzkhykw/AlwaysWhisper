@@ -46,9 +46,15 @@ dependencies = [
 [project.optional-dependencies]
 api = ["openai>=1.0", "pydub>=0.25.1", "python-dotenv>=1.0"]
 dev = ["pytest>=8.0"]
+live = [
+    "sounddevice>=0.5; sys_platform == 'darwin'",
+    "mlx-whisper==0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "pyobjc-framework-Cocoa>=10; sys_platform == 'darwin'",
+]
 
 [project.scripts]
 alwayswhisper = "alwayswhisper.cli:main"
+alwayswhisper-live = "alwayswhisper.live.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/kzkhykw/AlwaysWhisper"
