@@ -13,8 +13,25 @@ import time
 import types
 
 import numpy as np
+import pytest
 
 from alwayswhisper.live import live_transcriber as lt  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def transcript_fixture_timezone():
+    """Timestamp fixtures explicitly use Japan time, independent of the host."""
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "Asia/Tokyo"
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
 
 
 # ------------------------------------------------------------- test signals ---

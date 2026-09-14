@@ -1003,6 +1003,7 @@ def test_tick_hovering_reveals_expanded_history_stack_with_alphas():
         events.append(("eos",))
     events.append(("chunk", "LIVE"))
     controller, renderer, _dq = _controller(events)
+    controller._mouse_location = lambda: (-9999, -9999)
     controller.tick(now=0.0)   # collapsed first (previous test)
 
     controller._hovering = True
@@ -1014,6 +1015,7 @@ def test_tick_hovering_reveals_expanded_history_stack_with_alphas():
 
 def test_tick_holds_while_hovered_and_hides_after_leaving():
     controller, renderer, _dq = _controller([("chunk", "hello"), ("eos",)])
+    controller._mouse_location = lambda: (-9999, -9999)
     controller.tick(now=0.0)
     controller._hovering = True
     controller.tick(now=4.99)
@@ -1237,6 +1239,7 @@ def test_update_hover_only_calls_setter_on_state_change(monkeypatch):
 
     monkeypatch.setattr(controller, "_update_hover", fake_update_hover)
 
+    controller._mouse_location = lambda: (-9999, -9999)
     controller.tick(now=0.0)   # shows "hi"; hover check #1 -> stays not-hovering, no setter call
     controller.tick(now=0.1)   # hover check #2 -> flips to hovering, setter called once
     controller.tick(now=0.2)   # hover check #3 -> still hovering, no additional setter call
@@ -2979,6 +2982,7 @@ def test_corner_hover_does_not_expand_history_and_move_grip():
 
 def test_hover_entry_at_idle_deadline_is_checked_before_hiding(monkeypatch):
     controller, renderer, _ = _controller([("chunk", "hello"), ("eos",)])
+    controller._mouse_location = lambda: (-9999, -9999)
     controller.tick(now=0.0)
     def enter_panel():
         controller._hovering = True
@@ -3246,6 +3250,7 @@ def test_island_lifecycle_compact_before_speech_and_after_idle():
     renderer = _FakeRenderer()
     dq = _FakeDisplayQueue([])
     controller = co._OverlayController(dq, renderer=renderer, settings_path=None, position="dynamic-island")
+    controller._mouse_location = lambda: (-9999, -9999)
     controller.tick(now=0)
     assert renderer.calls[-1][0] == "show" and renderer.calls[-1][1] == []
     assert controller._panel_visible

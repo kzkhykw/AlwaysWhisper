@@ -64,9 +64,9 @@ def test_live_wires_audio_meter_and_always_stops_worker(monkeypatch, tmp_path, f
         assert kwargs["level_source"]() == (123, .5)
         assert kwargs["position"] == "free"
         raise KeyboardInterrupt
-    monkeypatch.setattr(cli.sys, "platform", "darwin")
-    monkeypatch.setattr(cli.platform, "machine", lambda: "arm64")
-    monkeypatch.setattr(cli.importlib.util, "find_spec", lambda _: object())
+    monkeypatch.setattr(cli, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(cli, "platform", SimpleNamespace(machine=lambda: "arm64"))
+    monkeypatch.setattr(cli, "importlib", SimpleNamespace(util=SimpleNamespace(find_spec=lambda _: object())))
     monkeypatch.setattr(cli, "session_lock", nullcontext)
     monkeypatch.setattr(cli.multiprocessing, "get_context", lambda _: SimpleNamespace(Queue=lambda **kwargs: queue))
     monkeypatch.setattr(overlay, "_require_appkit", lambda: None)
