@@ -706,8 +706,32 @@ alwayswhisper live --demo                     # マイク／モデル不要の�
 明示した表示位置オプションは保存済み設定より優先します。「視差効果を減らす」が
 有効な場合は開閉アニメーションを省略します。
 
-文字起こしは `~/Library/Application Support/AlwaysWhisper/transcripts/` に日別Markdownと
-セッション別JSONLで保存します。`--transcript-dir PATH` で変更できます。停止はCtrl-Cです。
+初回の対話実行時、まず表示言語を `1. 日本語` / `2. English` から選びます。
+セットアップと起動・終了案内が選んだ言語になり、次回以降も記憶します。
+Enterでは環境設定（`LC_ALL` → `LC_MESSAGES` → `LANG`、未設定時は英語）の候補を使います。
+`alwayswhisper live --ui-language ja` / `--ui-language en` で変更できます。
+表示言語は認識言語（`--language`）・字幕・カスタムプロンプトとは独立しています。
+保存先を設定済みのユーザーには言語だけを尋ねます。非対話実行では記憶済み言語、
+未設定なら環境の言語を使い、質問や自動保存はしません。
+診断ログ・依存ライブラリの出力・`--help` は従来の言語のままです。
+
+次に、ターミナルで文字起こしの保存先を選びます。Enterで
+`~/Documents/AlwaysWhisper` を使うか、好きなフォルダのパスを入力してください。
+旧保存先 `~/Library/Application Support/AlwaysWhisper/transcripts/` に文字起こしがある場合は、
+そちらを初期候補にします。既存ファイルは移動しません。
+選択は `~/.config/alwayswhisper/live.json` に記憶されます。
+`--choose-transcript-dir` で選び直し、`--transcript-dir PATH` で今回だけ変更できます。
+非対話実行では質問せず、記憶済みの保存先（未設定なら旧Application Support内）を使います。
+
+読み返すファイルは日別の `YYYY-MM-DD.md`、セッション別データは `live_*.jsonl` です。
+起動時に保存先の絶対パスと、Finderで開くための `open` コマンドを表示します。
+停止はCtrl-Cです。残りの文字起こしの保存が終わるまでお待ちください。
+
+認識用カスタムプロンプトの設定も起動時に案内します。デフォルトは引き続き未指定です。
+普段使う人名・製品名・専門用語をUTF-8ファイルに書き、
+`alwayswhisper live --glossary "/path/to/terms.txt"` で指定してください。
+ファイルを編集し、次回も同じオプションで指定すれば反映されます。
+これは音声認識用のヒントで、チャットへの指示文ではありません。
 `alwayswhisper-live` でも同じ機能を起動できます。ライブ音声認識はApple Siliconが必要です。
 既存のファイル文字起こし・動画字幕焼き込みコマンドもそのまま使えます。
 

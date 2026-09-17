@@ -1105,10 +1105,37 @@ mode remains draggable. Position and font size are saved in
 `~/.config/alwayswhisper/caption_overlay.json`; an explicit placement flag wins
 over the saved setting. Reduced Motion disables the open/close morph.
 
-Transcripts are saved under
-`~/Library/Application Support/AlwaysWhisper/transcripts/` as daily Markdown
-and per-session JSONL. Override this with `--transcript-dir PATH`, and stop with
-Ctrl-C to finish writing. `alwayswhisper-live` is an equivalent standalone
+On the first interactive run, first choose the terminal display language:
+`1. 日本語` / `2. English`. Setup and the startup/shutdown guide use your choice.
+Enter accepts the locale-based suggestion (`LC_ALL`, `LC_MESSAGES`, then `LANG`;
+English when unset). The choice is remembered alongside the transcript folder.
+Change it with `alwayswhisper live --ui-language ja` or `--ui-language en`.
+This does not change recognition language (`--language`), captions, or your prompt.
+Existing users with a saved folder are asked only for the missing language choice.
+Unattended runs use the saved display language or the locale fallback without
+prompting or saving a fallback. Diagnostic/dependency logs and `--help` retain
+their existing language.
+
+Next, choose where to save transcripts in the terminal:
+press Enter to accept `~/Documents/AlwaysWhisper`, or enter your own folder.
+If transcripts already exist in `~/Library/Application Support/AlwaysWhisper/transcripts/`,
+that folder is suggested instead. Existing files are never moved.
+The choice is remembered in `~/.config/alwayswhisper/live.json`.
+Use `--choose-transcript-dir` to choose again, or `--transcript-dir PATH` to
+override the folder for one run without changing the remembered choice.
+Unattended runs do not prompt: they use the remembered folder, or the previous
+Application Support location when no choice has been saved.
+
+Open `YYYY-MM-DD.md` to read your daily notes; `live_*.jsonl` contains per-session
+data. Startup shows the full folder path and a copyable `open` command for Finder.
+Stop with Ctrl-C to finish writing.
+
+Startup also shows the active recognition prompt. The default remains no custom
+prompt; use `alwayswhisper live --glossary "/path/to/terms.txt"` to supply a UTF-8
+file of names and specialist terms. Edit that file and pass it again on your next
+run. This biases speech recognition; it is not a chat instruction.
+
+`alwayswhisper-live` is an equivalent standalone
 entry point. Live microphone ASR requires Apple Silicon; file-based commands
 remain cross-platform.
 

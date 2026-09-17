@@ -11,9 +11,10 @@ import sys
 import time
 
 from . import caption_overlay
+from .transcript_settings import resolve_transcript_directory, resolve_ui_language
+from .terminal_ui import message, print_session_guide
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-mlx"
-DEFAULT_TRANSCRIPTS = Path.home() / "Library/Application Support/AlwaysWhisper/transcripts"
 
 
 def positive_float(value):
@@ -35,14 +36,27 @@ def configure_parser(parser):
     parser.add_argument("--sample-rate", type=positive_float, default=None)
     parser.add_argument("--model", default=DEFAULT_MODEL, help="MLX Whisper model repository")
     parser.add_argument("--language", default="ja", help="language code, or auto for detection")
+    parser.add_argument("--ui-language", choices=("ja", "en"),
+                        help="display language, remembered for future runs / 表示言語（記憶します）")
     parser.add_argument("--glossary", type=Path, help="UTF-8 vocabulary/bias prompt file")
-    parser.add_argument("--transcript-dir", type=Path, default=DEFAULT_TRANSCRIPTS)
+    folders = parser.add_mutually_exclusive_group()
+    folders.add_argument("--transcript-dir", type=Path,
+                         help="transcript folder for this run (otherwise use the remembered folder)")
+    folders.add_argument("--choose-transcript-dir", action="store_true",
+                         help="choose and remember a transcript folder in the terminal")
     parser.add_argument("--gate", type=positive_float, default=.006, help="speech detection RMS threshold")
     parser.add_argument("--max-sec", type=positive_float, default=8, help="maximum speech segment duration")
     parser.add_argument("--silence-sec", type=positive_float, default=.7, help="pause duration to end a segment")
     parser.add_argument("--demo", action="store_true", help="preview captions without a microphone or ASR model")
     parser.set_defaults(func=run)
     return parser
+
+
+def print_startup(args, directory, microphone, prompt):
+    print_session_guide(
+        args.ui_language or "en", directory=directory, command="alwayswhisper live",
+        recognition_language=args.language, microphone=microphone, model=args.model,
+        prompt=prompt, prompt_file=args.glossary)
 
 
 @contextmanager
@@ -85,22 +99,24 @@ def run(args):
     device = int(args.device) if args.device and args.device.isdecimal() else args.device
     info = sd.query_devices(device, "input")
     sr = int(args.sample_rate or info["default_samplerate"])
-    prompt = args.glossary.read_text(encoding="utf-8").strip() if args.glossary else None
+    prompt = args.glossary.expanduser().read_text(encoding="utf-8").strip() if args.glossary else None
     from .live_transcriber import LiveTranscriber
     with session_lock():
+        args.ui_language = resolve_ui_language(args.ui_language)
+        directory = resolve_transcript_directory(args.transcript_dir, choose=args.choose_transcript_dir,
+                                                 ui_language=args.ui_language)
         display_queue = multiprocessing.get_context("spawn").Queue(maxsize=512) if args.captions else None
         transcriber = LiveTranscriber(
             sr, args.model, None if args.language == "auto" else args.language,
-            str(args.transcript_dir.expanduser()), prompt=prompt,
+            str(directory), prompt=prompt,
             display_queue=display_queue, gate=args.gate,
             max_sec=args.max_sec, silence_sec=args.silence_sec,
         )
         def callback(indata, frames, timing, status):
             transcriber.feed(indata[:, 0])
         try:
+            print_startup(args, directory, info['name'], prompt)
             transcriber.start()
-            print(f"Microphone: {info['name']} | transcripts: {args.transcript_dir}")
-            print("Press Ctrl-C to stop and finish writing the transcript.")
             with sd.InputStream(device=device, channels=1, samplerate=sr,
                                 dtype="float32", callback=callback):
                 if args.captions:
@@ -114,10 +130,14 @@ def run(args):
         except KeyboardInterrupt:
             pass
         finally:
+            print(message(args.ui_language, "finishing"), flush=True)
             summary = transcriber.stop()
             if display_queue is not None:
                 display_queue.close()
-            print(f"Transcript: {summary['jsonl_path']}")
+            print(message(args.ui_language, "save_folder", path=directory))
+            if summary.get("md_path"):
+                print(message(args.ui_language, "notes", path=summary['md_path']))
+            print(message(args.ui_language, "session", path=summary['jsonl_path']))
 
 
 def main(argv=None):
