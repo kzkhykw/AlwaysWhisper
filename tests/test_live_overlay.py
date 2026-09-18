@@ -52,6 +52,7 @@ DEFAULT_SETTINGS_PATH -- so no test here ever reads or writes the real
 import os
 import queue
 import sys
+import time
 from unittest.mock import patch
 
 import pytest
@@ -325,6 +326,26 @@ def test_visible_rows_window_shifts_back_with_scroll_offset():
     ]
 
 
+def test_scroll_by_accepts_fractional_row_delta():
+    m = _model()
+    now = _push_lines(m, 10)
+    m.apply(("chunk", "LIVE"), now=now)
+    m.scroll_by(0.4, now)
+    assert m.offset_at(now) == pytest.approx(0.4)
+
+
+def test_visible_rows_includes_extra_older_row_when_offset_is_fractional():
+    """Smooth scroll needs the next-older row on stage so layout can clip
+    it in from the far end, instead of swapping the 2-row window whole."""
+    m = _model()
+    now = _push_lines(m, 10)
+    m.apply(("chunk", "LIVE"), now=now)
+    m.scroll_by(0.4, now)
+    assert m.visible_rows(now, expanded=True) == [
+        ("L7", False), ("L8", False), ("L9", False), ("LIVE", True),
+    ]
+
+
 def test_scroll_by_clamps_to_available_history_and_cannot_go_negative():
     m = _model()
     now = _push_lines(m, 6)  # history ends up L0..L5 (6 entries) after the LIVE push below
@@ -455,20 +476,21 @@ def test_alphas_for_partial_history_aligns_to_the_newest_live_adjacent_end():
     assert co._alphas_for(rows) == (0.75, 1.0)
 
 
+def test_alphas_for_extra_history_row_during_fractional_scroll():
+    rows = [("extra", False), ("a", False), ("b", False), ("live", True)]
+    assert co._alphas_for(rows) == (0.35, 0.55, 0.75, 1.0)
+
+
 # --------------------------------------------------- scroll-wheel event -> rows ---
 class _FakeScrollEvent:
-    """Duck-typed stand-in for NSEvent covering only what
-    _row_delta_from_scroll_event reads: hasPreciseScrollingDeltas() and
-    scrollingDeltaY(). A REAL trackpad/mouse gesture cannot be synthesized
-    in this sandbox (see _row_delta_from_scroll_event's own docstring), so
-    this tests the pure accumulator/threshold/sign arithmetic against
-    controlled inputs -- not the actual hardware-to-sign mapping, which is
-    sourced from Apple's NSEvent.h doc comments instead (see that same
-    docstring)."""
+    """Duck-typed stand-in for NSEvent covering what
+    _row_delta_from_scroll_event and _is_command_scroll read:
+    hasPreciseScrollingDeltas(), scrollingDeltaY(), and modifierFlags()."""
 
-    def __init__(self, delta_y, precise=True):
+    def __init__(self, delta_y, precise=True, command=False):
         self._delta_y = delta_y
         self._precise = precise
+        self._command = command
 
     def hasPreciseScrollingDeltas(self):
         return self._precise
@@ -476,25 +498,37 @@ class _FakeScrollEvent:
     def scrollingDeltaY(self):
         return self._delta_y
 
+    def modifierFlags(self):
+        return co._NSEVENT_MODIFIER_FLAG_COMMAND if self._command else 0
+
+
+def test_history_scroll_sign_follows_content_not_scrollbar():
+    """Hands-on: the original +1 mapping (swipe-up = older) felt inverted
+    for a chat stack with older rows above the live line."""
+    assert co._SCROLL_SIGN == -1
+
 
 def test_row_delta_precise_scroll_crossing_one_row_threshold():
+    # Swipe UP (positive scrollingDeltaY) -> toward live (negative rows).
     rows, accum = co._row_delta_from_scroll_event(_FakeScrollEvent(60.0), 0.0)
-    assert rows == 2     # 60px / 30px-per-row (_PX_PER_ROW)
+    assert rows == -2    # 60px / 30px-per-row (_PX_PER_ROW), history sign flipped
     assert accum == 0.0
 
 
 def test_row_delta_accumulates_subrow_remainder_across_events():
     rows1, accum1 = co._row_delta_from_scroll_event(_FakeScrollEvent(20.0), 0.0)
     assert rows1 == 0
-    assert accum1 == 20.0
+    assert accum1 == -20.0
     rows2, accum2 = co._row_delta_from_scroll_event(_FakeScrollEvent(20.0), accum1)
-    assert rows2 == 1    # 40px accumulated crosses the 30px-per-row threshold once
-    assert accum2 == 10.0
+    assert rows2 == -1   # -40px accumulated crosses the 30px-per-row threshold once
+    assert accum2 == -10.0
 
 
-def test_row_delta_negative_scroll_is_negative_row_delta():
+def test_row_delta_swipe_down_is_positive_row_delta_older():
+    """Swipe DOWN (negative scrollingDeltaY) reveals older history above
+    the live row -- the Messages/Slack direction."""
     rows, _accum = co._row_delta_from_scroll_event(_FakeScrollEvent(-60.0), 0.0)
-    assert rows == -2
+    assert rows == 2
 
 
 def test_row_delta_non_precise_wheel_event_is_scaled_up():
@@ -502,10 +536,31 @@ def test_row_delta_non_precise_wheel_event_is_scaled_up():
     # which alone wouldn't cross even one row's px threshold at face value
     # -- hasPreciseScrollingDeltas()=False triggers the _WHEEL_LINE_SCALE
     # multiplier (per NSEvent.h's own doc comment quoted in
-    # _row_delta_from_scroll_event).
+    # _row_delta_from_scroll_event). History sign still applies.
     rows, accum = co._row_delta_from_scroll_event(_FakeScrollEvent(1.0, precise=False), 0.0)
     assert rows == 0
-    assert accum == 10.0  # 1.0 * _WHEEL_LINE_SCALE (10.0)
+    assert accum == -10.0  # -1 * 1.0 * _WHEEL_LINE_SCALE (10.0)
+
+
+def test_row_delta_cmd_scroll_sign_keeps_scroll_up_as_grow():
+    """Cmd+scroll font-size must NOT inherit the history flip: scroll-up
+    still grows the font (positive steps)."""
+    rows, accum = co._row_delta_from_scroll_event(
+        _FakeScrollEvent(60.0), 0.0, sign=co._SCALE_SIGN)
+    assert co._SCALE_SIGN == 1
+    assert rows == 2
+    assert accum == 0.0
+
+
+def test_scroll_rows_from_event_is_continuous_not_quantized():
+    """History scroll must apply every pixel, not wait for a whole row."""
+    delta = co._scroll_rows_from_event(_FakeScrollEvent(-15.0))
+    assert delta == pytest.approx(0.5)
+
+
+def test_scroll_rows_from_event_swipe_up_is_toward_live():
+    delta = co._scroll_rows_from_event(_FakeScrollEvent(15.0))
+    assert delta == pytest.approx(-0.5)
 
 
 # ============================================================ OverlayGeometry ===
@@ -852,7 +907,7 @@ class _FakeRenderer:
     def __init__(self):
         self.calls = []  # ("show", rows, alphas, font_size, geometry, decor) | ("hide",)
 
-    def show(self, rows, alphas, font_size, geometry, decor=None):
+    def show(self, rows, alphas, font_size, geometry, decor=None, scroll_frac=0.0):
         self.calls.append(("show", rows, alphas, font_size, geometry, decor))
 
     def hide(self):
@@ -1072,6 +1127,63 @@ def test_tick_scroll_changes_state_and_triggers_repaint_even_with_same_live_text
 
     assert first_call != second_call
     assert second_call[0] == "show"
+
+
+def test_handle_scroll_wheel_swipe_down_scrolls_to_older_history():
+    """End-to-end: a swipe-down event on the controller increases the
+    history offset (older rows), matching Messages/Slack."""
+    events = []
+    for i in range(6):
+        events.append(("chunk", f"L{i}"))
+        events.append(("eos",))
+    events.append(("chunk", "LIVE"))
+    controller, _renderer, _dq = _controller(events)
+    controller.tick(now=0.0)
+    assert controller.model.offset_at(0.0) == 0
+
+    controller._handle_scroll_wheel(_FakeScrollEvent(-60.0))  # swipe down
+
+    assert controller.model.offset_at(time.monotonic()) == pytest.approx(2.0)
+
+
+def test_handle_scroll_wheel_swipe_up_from_live_stays_at_live():
+    events = []
+    for i in range(6):
+        events.append(("chunk", f"L{i}"))
+        events.append(("eos",))
+    events.append(("chunk", "LIVE"))
+    controller, _renderer, _dq = _controller(events)
+    controller.tick(now=0.0)
+
+    controller._handle_scroll_wheel(_FakeScrollEvent(60.0))  # swipe up, already at live
+
+    assert controller.model.offset_at(time.monotonic()) == 0
+
+
+def test_handle_scroll_wheel_partial_swipe_moves_fractionally():
+    """A 15px swipe (half of _PX_PER_ROW) used to be a no-op until 30px
+    accumulated; it must now move half a row so trackpad motion is smooth."""
+    events = []
+    for i in range(6):
+        events.append(("chunk", f"L{i}"))
+        events.append(("eos",))
+    events.append(("chunk", "LIVE"))
+    controller, _renderer, _dq = _controller(events)
+    controller.tick(now=0.0)
+
+    controller._handle_scroll_wheel(_FakeScrollEvent(-15.0))
+
+    assert controller.model.offset_at(time.monotonic()) == pytest.approx(0.5)
+
+
+def test_handle_scroll_wheel_cmd_scroll_up_grows_font():
+    """History-sign flip must not reverse Cmd+scroll: swipe-up still grows."""
+    controller, _renderer, _dq = _controller([("chunk", "hello")])
+    before = controller.geometry.font_size
+
+    controller._handle_scroll_wheel(_FakeScrollEvent(60.0, command=True))
+
+    assert controller.geometry.font_size == pytest.approx(before * (1.1 ** 2))
 
 
 # ------------------------------------------ controller construction + settings ---
@@ -1666,6 +1778,48 @@ def test_compute_layout_empty_row_sizes_returns_no_chips_or_boxes():
     assert panel_rect[3] == 0.0
 
 
+def test_compute_layout_fractional_scroll_keeps_viewport_height_and_live_pinned():
+    """An extra older row is on stage for clipping, but the panel must stay
+    the same height as the 2-history+live window, and the live row stays put."""
+    frame = _FakeFrame(0, 0, 2000, 1000)
+    geometry = _geometry()
+    visible = [("h1", 40, 20), ("h2", 40, 20), ("live", 40, 20)]
+    with_extra = [("extra", 40, 20), ("h1", 40, 20), ("h2", 40, 20), ("live", 40, 20)]
+    base, base_chips, _ = co._compute_layout(visible, 28.0, None, frame, geometry)
+    clipped, chips, _ = co._compute_layout(
+        with_extra, 28.0, None, frame, geometry, scroll_frac=0.0)
+    assert clipped[3] == pytest.approx(base[3])
+    assert chips[-1][1] == pytest.approx(base_chips[-1][1])  # live chip_y
+
+
+def test_compute_layout_fractional_scroll_shifts_history_toward_live():
+    frame = _FakeFrame(0, 0, 2000, 1000)
+    geometry = _geometry()
+    with_extra = [("extra", 40, 20), ("h1", 40, 20), ("h2", 40, 20), ("live", 40, 20)]
+    _, chips0, _ = co._compute_layout(
+        with_extra, 28.0, None, frame, geometry, scroll_frac=0.0)
+    _, chips1, _ = co._compute_layout(
+        with_extra, 28.0, None, frame, geometry, scroll_frac=0.5)
+    live_y0, live_y1 = chips0[-1][1], chips1[-1][1]
+    assert live_y1 == pytest.approx(live_y0)
+    assert chips1[1][1] < chips0[1][1]   # h1 closer to live
+    assert chips1[0][1] < chips0[0][1]   # extra closer to live / entering
+
+
+def test_compute_layout_fractional_scroll_top_anchored_keeps_live_and_height():
+    """Dynamic Island (top_anchored) uses the same clip: live stays just
+    below the camera, panel height matches the 2-history window."""
+    frame = _FakeFrame(0, 0, 2000, 1000)
+    geometry = co.OverlayGeometry(position="notch")
+    visible = [("h1", 40, 20), ("h2", 40, 20), ("live", 40, 20)]
+    with_extra = [("extra", 40, 20), ("h1", 40, 20), ("h2", 40, 20), ("live", 40, 20)]
+    base, base_chips, _ = co._compute_layout(visible, 28.0, None, frame, geometry)
+    clipped, chips, _ = co._compute_layout(
+        with_extra, 28.0, None, frame, geometry, scroll_frac=0.4)
+    assert clipped[3] == pytest.approx(base[3])
+    assert chips[-1][1] == pytest.approx(base_chips[-1][1])
+
+
 # ------------------------------------------------------- _drag_reposition_origin ---
 # Regression coverage for "the panel visibly jumps sideways right after a drag":
 # _handle_mouse_drag's LIVE (pre-full-repaint) reposition used to center the
@@ -1865,7 +2019,7 @@ class _FakeRendererWithBoxes(_FakeRenderer):
         super().__init__()
         self._boxes = boxes or []
 
-    def show(self, rows, alphas, font_size, geometry, decor=None):
+    def show(self, rows, alphas, font_size, geometry, decor=None, scroll_frac=0.0):
         self.calls.append(("show", rows, alphas, font_size, geometry, decor))
         return self._boxes
 
@@ -3237,6 +3391,24 @@ def test_island_animation_keeps_camera_covered_and_stays_between_endpoints():
         assert previous_width <= rect[2] <= expanded[2]
         previous_width = rect[2]
     assert co._island_tween(compact, expanded, 2) == expanded
+
+
+def test_island_does_not_morph_when_already_expanded():
+    """Scroll/text updates while expanded must not run the 0.24s size morph
+    -- that was a big source of jumpy history scrolling."""
+    assert co._island_should_morph(
+        was_visible=True, was_compact=False, now_compact=False,
+        reduce_motion=False, same_anchor=True,
+        start=(0, 0, 400, 200), target=(0, 0, 400, 220),
+    ) is False
+
+
+def test_island_morphs_compact_to_expanded():
+    assert co._island_should_morph(
+        was_visible=True, was_compact=True, now_compact=False,
+        reduce_motion=False, same_anchor=True,
+        start=(0, 0, 160, 40), target=(0, 0, 400, 200),
+    ) is True
 
 
 def test_island_without_camera_is_a_detached_pill():

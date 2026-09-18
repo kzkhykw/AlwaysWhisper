@@ -60,10 +60,13 @@ class CaptionLineModel:
     Scrollback (Apple Live Captions-style, only reachable while expanded):
     scroll_by(row_delta, now) moves a scroll OFFSET (positive = further
     back into history/older, negative = toward the live row/newer,
-    clamped to [0, max(0, len(history) - HISTORY_WINDOW)]) that shifts
-    which HISTORY_WINDOW-sized slice of history is shown -- the live row
-    itself never moves, always shown, always last. AUTO_RETURN_SEC (10s) of
-    no further scroll_by() lazily resets the effective offset back to 0 (no
+    clamped to [0, max(0, len(history) - HISTORY_WINDOW)]). The offset is a
+    float so trackpad motion can slide continuously; the integer part
+    selects which HISTORY_WINDOW-sized slice of history is shown and the
+    fractional part is a clip-shift of the next-older row (see
+    visible_rows / _compute_layout). The live row itself never moves,
+    always shown, always last. AUTO_RETURN_SEC (10s) of no further
+    scroll_by() lazily resets the effective offset back to 0 (no
     background timer -- computed fresh from `now` on every read, exactly
     like idle_clear_sec). While the effective offset is > 0, OR `hold` is
     passed to visible_at/visible_rows (hover/drag), idle-hide is suppressed
@@ -83,7 +86,7 @@ class CaptionLineModel:
         self._ended = True          # nothing has started yet -> next chunk starts fresh
         self._last_event_at = None  # monotonic time of the last event, or None if none yet
         self._history = []          # oldest -> newest, capped at HISTORY_CAP
-        self._offset = 0            # raw scroll offset: rows back from live (0 = at the live edge)
+        self._offset = 0.0          # raw scroll offset: rows back from live (0 = at the live edge)
         self._last_scroll_at = None  # monotonic time of the last scroll_by(), or None if never scrolled
 
     def apply(self, event, now):
@@ -180,7 +183,9 @@ class CaptionLineModel:
         rows, the window scroll_by()'s offset selects (shifting toward
         older entries as the offset grows), THEN the live row, always
         last, always present (pinned at the bottom regardless of scroll
-        offset)."""
+        offset). A fractional offset also includes the next-older history
+        row so the layout can clip it in smoothly (see _compute_layout's
+        scroll_frac)."""
         if not self.visible_at(now, hold=expanded or hold):
             return []
         effective_expanded = expanded or self._effective_offset(now) > 0
@@ -188,13 +193,18 @@ class CaptionLineModel:
             return [(self._text, True)]
         n = len(self._history)
         o = self._effective_offset(now)
-        window = self._history[max(0, n - self.HISTORY_WINDOW - o): n - o]
+        floor_o = int(math.floor(o))
+        extra = 1 if (o - floor_o) > 1e-6 else 0
+        start = max(0, n - self.HISTORY_WINDOW - extra - floor_o)
+        end = n - floor_o
+        window = self._history[start:end]
         return [(t, False) for t in window] + [(self._text, True)]
 
     def scroll_by(self, row_delta, now):
         """Move the scroll offset by `row_delta` rows: positive scrolls
         further back into history (older), negative scrolls forward toward
-        the live row (newer). Clamped to [0, max(0, len(history) -
+        the live row (newer). `row_delta` may be fractional so a trackpad
+        can slide continuously. Clamped to [0, max(0, len(history) -
         HISTORY_WINDOW)] -- can't scroll past the oldest entry, or past the
         live edge. Re-bases from the EFFECTIVE offset (offset_at(now)), not
         the raw one: if AUTO_RETURN_SEC had already lazily reset the
@@ -206,7 +216,8 @@ class CaptionLineModel:
         auto-return countdown."""
         max_offset = max(0, len(self._history) - self.HISTORY_WINDOW)
         start = self._effective_offset(now)
-        self._offset = max(0, min(max_offset, start + row_delta))
+        offset = max(0.0, min(float(max_offset), start + row_delta))
+        self._offset = 0.0 if offset < 1e-6 else offset
         self._last_scroll_at = now
 
 
@@ -702,6 +713,8 @@ def _make_panel(font_size):
     content.on_mouse_drag = None
     content.on_mouse_up = None
     content.debug_input = False
+    content.setWantsLayer_(True)
+    content.setClipsToBounds_(True)
     panel.setContentView_(content)
 
     return panel, content
@@ -764,19 +777,19 @@ _ROW_GAP = 8.0        # vertical gap between stacked row chips
 _LIVE_ALPHA = 1.0
 # Per-row alphaValue by position within the CURRENTLY SHOWN window, newest
 # history row first (i.e. index 0 = the history row immediately above the
-# live row = "1 back", index 1 = "2 back"). Deliberately positional, not
+# live row = "1 back", index 1 = "2 back", index 2 = the extra older row
+# clipped in during a fractional scroll). Deliberately positional, not
 # based on absolute distance back through all of history: even scrolled
-# deep into history, the newest-shown row of the current 2-row window
-# always gets the least-faded alpha, matching "history rows newest->oldest
-# 0.75/0.55" read as describing whatever's on screen right now.
-_HISTORY_ALPHAS_NEWEST_FIRST = (0.75, 0.55)
+# deep into history, the newest-shown row of the current window always
+# gets the least-faded alpha.
+_HISTORY_ALPHAS_NEWEST_FIRST = (0.75, 0.55, 0.35)
 
 
 def _alphas_for(rows):
     """(alpha, ...) parallel to `rows` (oldest -> newest, live last -- see
     CaptionLineModel.visible_rows): _LIVE_ALPHA for the live row, and
     _HISTORY_ALPHAS_NEWEST_FIRST assigned to however many history rows are
-    actually present (0-2), aligned to the NEWEST (live-adjacent) end --
+    actually present (0-3), aligned to the NEWEST (live-adjacent) end --
     e.g. with only 2 history rows shown, they get (0.55, 0.75), not
     (0.75, 0.55): the OLDER of the two is "2 back" (0.55), not "1 back".
     Pure function, no AppKit -- unit-tested directly."""
@@ -965,7 +978,7 @@ def _island_anchor(screen):
     return IslandAnchor(center, top, width, height, frame.size.width, max(1.0, scale))
 
 
-def _island_layout(row_sizes, font_size, hover_row, anchor):
+def _island_layout(row_sizes, font_size, hover_row, anchor, scroll_frac=0.0):
     """One continuous surface from screen top, with text below the housing.
 
     No rows means the compact island: only safe left/right status wings.
@@ -986,7 +999,8 @@ def _island_layout(row_sizes, font_size, hover_row, anchor):
         size=SimpleNamespace(width=anchor.screen_width,
                              height=anchor.top - anchor.header_height))
     rect, chips, boxes = _compute_layout(padded, font_size, hover_row, visible,
-                                        OverlayGeometry(position="notch"), pad_y=anchor.caption_padding)
+                                        OverlayGeometry(position="notch"), pad_y=anchor.caption_padding,
+                                        scroll_frac=scroll_frac)
     x, y, w, h = rect
     # Whole-point, even width prevents NSWindow's frame rounding from starting
     # another tiny resize (and nudging text) when only the hover state changes.
@@ -1012,6 +1026,20 @@ def _island_tween(start, target, progress):
     p = max(0.0, min(1.0, progress))
     t = 1 - (1 - p) ** 3
     return tuple(a + (b - a) * t for a, b in zip(start, target))
+
+
+def _island_should_morph(was_visible, was_compact, now_compact, reduce_motion,
+                         same_anchor, start, target):
+    """Whether _IslandSurface.show should run the 0.24s compact<->expanded
+    size morph. Scroll/text updates while already expanded must NOT morph
+    -- that resize animation is what made history scrolling feel jumpy.
+    First show, reduce-motion, a display change, or an already-matching
+    frame also skip the morph (draw the target immediately)."""
+    if reduce_motion or not was_visible or not same_anchor or start == target:
+        return False
+    if not was_compact and not now_compact:
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -1122,7 +1150,8 @@ def _icon_reserve_for(font_size):
     return icon_size, 2 * icon_size + _ICON_GAP + _PAD_X
 
 
-def _compute_layout(row_sizes, font_size, hover_row, visible_frame, geometry, *, pad_y=_PAD_Y):
+def _compute_layout(row_sizes, font_size, hover_row, visible_frame, geometry, *,
+                    pad_y=_PAD_Y, scroll_frac=0.0, history_window=None):
     """Pure layout math for the caption stack (no AppKit) -- split out of
     _layout_stack so the hover copy-icon geometry has direct unit test
     coverage without a real WindowServer. `row_sizes` is [(text, text_w,
@@ -1206,19 +1235,33 @@ def _compute_layout(row_sizes, font_size, hover_row, visible_frame, geometry, *,
         width = max(280.0, max(w for w, _h in text_sizes))
         text_sizes = [(width, h) for _w, h in text_sizes]
     text_panel_w = max(w for w, _h in text_sizes)
+    n = len(row_sizes)
+    if history_window is None:
+        history_window = CaptionLineModel.HISTORY_WINDOW
+    n_extra = max(0, n - 1 - history_window)
+    frac = max(0.0, min(1.0, float(scroll_frac)))
+    extra_block_h = 0.0
+    shift = 0.0
+    if n_extra > 0:
+        extra_block_h = (sum(text_sizes[i][1] for i in range(n_extra))
+                         + _ROW_GAP * n_extra)
+        shift = frac * (text_sizes[n_extra - 1][1] + _ROW_GAP)
     panel_h = sum(h for _w, h in text_sizes) + _ROW_GAP * (len(text_sizes) - 1)
+    panel_h -= extra_block_h
     panel_w = text_panel_w + icon_reserve   # ALWAYS reserved -- see docstring above
 
     ox, oy = _panel_origin(visible_frame,
                            panel_w if geometry.top_anchored else text_panel_w,
                            panel_h, geometry)
 
-    n = len(row_sizes)
     y_positions = [0.0] * n
     y_cursor = 0.0
     for i in range(n - 1, -1, -1):
         y_positions[i] = y_cursor
         y_cursor += text_sizes[i][1] + _ROW_GAP
+    if shift:
+        for i in range(n - 1):  # live stays pinned; history slides toward it
+            y_positions[i] -= shift
     if geometry.top_anchored:
         y_positions = [panel_h - y - text_sizes[i][1] for i, y in enumerate(y_positions)]
 
@@ -1328,7 +1371,8 @@ def _make_overlay_control(rect, kind):
     return view
 
 
-def _layout_stack(panel, content, rows, alphas, font_size, geometry, decor=None):
+def _layout_stack(panel, content, rows, alphas, font_size, geometry, decor=None,
+                  scroll_frac=0.0):
     """Lay out `rows` (oldest -> newest, live last -- see
     CaptionLineModel.visible_rows) as a bottom-up stack of rounded row
     chips inside `content`, position the panel per `geometry` (bottom edge
@@ -1400,7 +1444,8 @@ def _layout_stack(panel, content, rows, alphas, font_size, geometry, decor=None)
         row_sizes.append((text, text_w, text_h))
 
     panel_rect, chip_layouts, row_boxes = _compute_layout(
-        row_sizes, font_size, decor.hover_row, visible, geometry)
+        row_sizes, font_size, decor.hover_row, visible, geometry,
+        scroll_frac=scroll_frac)
     panel_x, panel_y, panel_w, panel_h = panel_rect
 
     panel_h += _CONTROL_HEIGHT
@@ -1669,7 +1714,7 @@ class _IslandSurface:
             self.timer.invalidate()
             self.timer = None
 
-    def show(self, rows, alphas, font_size, geometry, decor):
+    def show(self, rows, alphas, font_size, geometry, decor, scroll_frac=0.0):
         import AppKit
         screen = _caption_screen(self.panel, AppKit.NSScreen.mainScreen(),
                                  AppKit.NSScreen.screens(), geometry)
@@ -1687,8 +1732,10 @@ class _IslandSurface:
             w, h = _measure_row_size(label, text, max_width)
             labels.append(label)
             sizes.append((text, w, h))
-        target, chips, boxes = _island_layout(sizes, font_size, decor.hover_row, anchor)
+        target, chips, boxes = _island_layout(sizes, font_size, decor.hover_row, anchor,
+                                              scroll_frac=scroll_frac)
         was_visible = self.panel.isVisible()
+        was_compact = self.compact
         old_frame = self.panel.frame()
         start = (old_frame.origin.x, old_frame.origin.y, old_frame.size.width, old_frame.size.height)
         self.stop()
@@ -1734,15 +1781,16 @@ class _IslandSurface:
                                 "accessibilityDisplayShouldReduceMotion", lambda: False)()
         same_anchor = (abs(start[0] + start[2] / 2 - anchor.center_x) < 1
                        and abs(start[1] + start[3] - anchor.top) < 1)
-        if not was_visible or reduce_motion or not same_anchor or start == target:
-            self._draw(target)
-        else:
+        if _island_should_morph(was_visible, was_compact, self.compact,
+                                reduce_motion, same_anchor, start, target):
             self.start_frame = start
             self.started_at = time.monotonic()
             self._draw(start)
             self.timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
                 1 / 60, True, lambda _timer: self.advance())
             AppKit.NSRunLoop.currentRunLoop().addTimer_forMode_(self.timer, AppKit.NSRunLoopCommonModes)
+        else:
+            self._draw(target)
         self.panel.orderFrontRegardless()
         return boxes
 
@@ -1840,16 +1888,18 @@ class _AppKitRenderer:
             self.status_item.close()
             self.status_item = None
 
-    def show(self, rows, alphas, font_size, geometry, decor=None):
+    def show(self, rows, alphas, font_size, geometry, decor=None, scroll_frac=0.0):
         if geometry.top_anchored:
             if self.island is None:
                 self.island = _IslandSurface(self.panel, self.content)
                 self.island.audio_level = self.audio_meter.level
-            return self.island.show(rows, alphas, font_size, geometry, decor)
+            return self.island.show(rows, alphas, font_size, geometry, decor,
+                                    scroll_frac=scroll_frac)
         if self.island is not None:
             self.island.stop()
             self.island = None
-        boxes = _layout_stack(self.panel, self.content, rows, alphas, font_size, geometry, decor=decor)
+        boxes = _layout_stack(self.panel, self.content, rows, alphas, font_size, geometry,
+                              decor=decor, scroll_frac=scroll_frac)
         return boxes
 
     def screen_state(self, geometry):
@@ -1905,47 +1955,35 @@ class _AppKitRenderer:
 # _WHEEL_LINE_SCALE first to land in the same points-ish range.
 _PX_PER_ROW = 30.0
 _WHEEL_LINE_SCALE = 10.0
-# +1 = scroll_by(+1) (further into history/older); see
-# _row_delta_from_scroll_event's docstring for exactly how this was
-# determined -- and its caveat that it could not be hands-on tested here.
-_SCROLL_SIGN = 1
+# History-scroll sign, applied in _row_delta_from_scroll_event.
+# CaptionLineModel.scroll_by: positive = older, negative = toward live.
+# Natural scrolling moves the CONTENT with the fingers, and older rows sit
+# ABOVE the live line, so swipe-DOWN (negative scrollingDeltaY) must yield
+# a POSITIVE row_delta. The original +1 mapping (swipe-up = older, like a
+# scrollbar) felt inverted on a real trackpad; this is the flip the
+# function's own docstring used to invite. Cmd+scroll font-size uses
+# _SCALE_SIGN instead, so it does not inherit this flip.
+_SCROLL_SIGN = -1
+_SCALE_SIGN = 1  # scroll-up grows the font (browser-zoom direction)
 
 
-def _row_delta_from_scroll_event(event, accumulated_px):
+def _row_delta_from_scroll_event(event, accumulated_px, sign=_SCROLL_SIGN):
     """Convert one NSScrollWheel event into (row_delta, new_accumulated_px)
     -- row_delta is an int (usually -1/0/+1, occasionally more for a fast
     fling), new_accumulated_px is the leftover sub-row remainder to carry
     into the next event.
 
-    Direction, verified from Apple's own header doc comments (Apple's live
-    web docs at developer.apple.com render via JS and returned no text
-    through WebFetch; the actual NSEvent.h doc comments, via a GitHub
-    mirror of the macOS SDK headers, are the primary source used here) --
-    NOT from a hands-on trackpad/mouse test, which this sandboxed
-    environment cannot perform (no pyobjc-framework-Quartz for
-    CGEventCreateScrollWheelEvent to synthesize a real scroll event, and
-    osascript/System Events UI automation is denied Accessibility access
-    here -- confirmed while investigating an earlier part of this same
-    feature):
-      - isDirectionInvertedFromDevice's doc comment: "the user may choose
-        to change the scrolling behavior such that it feels like they are
-        moving the content instead of the scroll bar. To accomplish this,
-        deltaX/Y and scrollingDeltaX/Y are automatically inverted for
-        NSScrollWheel events according to the user's preference[s]" --
-        i.e. scrollingDeltaY's sign, as read here, ALREADY reflects
-        "natural scrolling" (macOS's default since Lion/10.7): it feels
-        like moving the CONTENT with your fingers.
-      - deltaY's doc comment (legacy swipe API, same underlying
-        convention): "-1 for swipe down and 1 for swipe up".
-      - Swiping UP is the SAME gesture that, with natural scrolling,
-        reveals OLDER content further up a page/terminal/chat log -- the
-        direction this feature must match (older is above). That gesture
-        reports a POSITIVE scrollingDeltaY per the above.
-    Net result: POSITIVE scrollingDeltaY -> POSITIVE row_delta (older) --
-    no sign flip against CaptionLineModel.scroll_by's own convention
-    (positive = further into history). If a real hands-on check
-    (`--demo --hold 30`) ever shows this backward, flip _SCROLL_SIGN --
-    nothing else about this function needs to change.
+    Direction, from Apple's NSEvent.h doc comments PLUS a hands-on
+    correction:
+      - isDirectionInvertedFromDevice's doc comment: scrollingDeltaY's
+        sign ALREADY reflects natural scrolling (moving the CONTENT).
+      - Older caption rows sit ABOVE the pinned live row. Swiping DOWN
+        moves the content down and reveals that older history -- the
+        Messages/Slack direction. That gesture reports a NEGATIVE
+        scrollingDeltaY, and CaptionLineModel.scroll_by wants a POSITIVE
+        delta for older, so the default `sign` is _SCROLL_SIGN = -1.
+        Cmd+scroll font-size passes _SCALE_SIGN = +1 instead (scroll-up
+        grows), so the two gestures stay independent.
 
     hasPreciseScrollingDeltas()/scrollingDeltaY() scaling per NSEvent.h's
     own doc comment on scrollingDeltaX/Y: "When -hasPreciseScrollDeltas
@@ -1956,20 +1994,31 @@ def _row_delta_from_scroll_event(event, accumulated_px):
         delta_px = event.scrollingDeltaY()
     else:
         delta_px = event.scrollingDeltaY() * _WHEEL_LINE_SCALE
-    accumulated_px += _SCROLL_SIGN * delta_px
+    accumulated_px += sign * delta_px
     rows = int(accumulated_px / _PX_PER_ROW)  # truncates toward 0, keeping the sub-row remainder
     accumulated_px -= rows * _PX_PER_ROW
     return rows, accumulated_px
 
 
-# Reused verbatim (same accumulator/threshold math, own accumulator
-# variable) for Cmd+scroll FONT-SIZE steps -- see
-# _OverlayController._handle_scroll_wheel -- not just history row-scroll:
-# "POSITIVE scrollingDeltaY -> POSITIVE row_delta" above means scroll-UP
-# also yields a positive step count here, which OverlayGeometry.scale_by
-# treats as GROWING the font (1.1**steps with steps > 0) -- i.e. scroll-up
-# = larger, matching the same "up = more/older" feel as history scroll,
-# with no extra sign flip needed.
+def _scroll_rows_from_event(event, px_per_row=_PX_PER_ROW):
+    """Fractional history-row delta for one NSScrollWheel event.
+
+    Unlike _row_delta_from_scroll_event (used for Cmd+scroll font steps,
+    which WANT discrete notches), this applies every pixel immediately so
+    a trackpad slides the history stack continuously. Sign is _SCROLL_SIGN
+    (swipe-down = older). Non-precise mouse wheels are scaled by
+    _WHEEL_LINE_SCALE first, same as the quantized helper."""
+    if event.hasPreciseScrollingDeltas():
+        delta_px = event.scrollingDeltaY()
+    else:
+        delta_px = event.scrollingDeltaY() * _WHEEL_LINE_SCALE
+    return _SCROLL_SIGN * delta_px / px_per_row
+
+
+# Reused (same accumulator/threshold math, own accumulator variable) for
+# Cmd+scroll FONT-SIZE steps -- see _OverlayController._handle_scroll_wheel
+# -- with sign=_SCALE_SIGN so scroll-up still grows the font (1.1**steps
+# with steps > 0), independent of the history-scroll flip.
 
 _NSEVENT_MODIFIER_FLAG_COMMAND = 1 << 20   # stable value of AppKit.NSEventModifierFlagCommand
 
@@ -2129,7 +2178,6 @@ class _OverlayController:
         self._hovering = False
         self._expanded = False
         self._panel_visible = False
-        self._scroll_accum_px = 0.0
         self._scale_accum_px = 0.0
         self._dragging = False
         self._drag_base = None
@@ -2181,16 +2229,17 @@ class _OverlayController:
 
     def _handle_scroll_wheel(self, event):
         if _is_command_scroll(event):
-            steps, self._scale_accum_px = _row_delta_from_scroll_event(event, self._scale_accum_px)
+            steps, self._scale_accum_px = _row_delta_from_scroll_event(
+                event, self._scale_accum_px, sign=_SCALE_SIGN)
             if steps:
                 self.geometry.scale_by(steps)
                 self._settings_dirty_at = time.monotonic()
                 if self._debug_input:
                     _log_debug_input(f"scale steps={steps} -> font_size={self.geometry.font_size:.1f}")
             return
-        rows, self._scroll_accum_px = _row_delta_from_scroll_event(event, self._scroll_accum_px)
-        if rows:
-            self.model.scroll_by(rows, time.monotonic())
+        delta = _scroll_rows_from_event(event)
+        if delta:
+            self.model.scroll_by(delta, time.monotonic())
             # tick()'s own timer picks up the resulting state change on its
             # next cycle (<=_POLL_INTERVAL_SEC away, imperceptible) -- not
             # forced here, to avoid re-entering tick() from inside AppKit's
@@ -2733,7 +2782,8 @@ class _OverlayController:
             self._last_state = state
             self._panel_visible = bool(rows) or self.geometry.top_anchored
             if self._panel_visible:
-                boxes = self.renderer.show(rows, alphas, self.geometry.font_size, self.geometry, decor=decor)
+                boxes = self.renderer.show(rows, alphas, self.geometry.font_size, self.geometry,
+                                   decor=decor, scroll_frac=offset - math.floor(offset))
                 self._row_boxes = list(boxes) if boxes else []
                 if self._debug_input and decor.hover_row is not None:
                     self._log_repaint_debug(rows, decor)
@@ -3051,13 +3101,13 @@ def _run_demo(font_size, hold_sec=0.0, debug_input=False, position=None):
     # on it being the only evidence.
     real_show, real_hide = controller.renderer.show, controller.renderer.hide
 
-    def _show_and_log(rows, alphas, font_size, geometry, decor=None):
+    def _show_and_log(rows, alphas, font_size, geometry, decor=None, scroll_frac=0.0):
         live_text = rows[-1][0] if rows else ""
         preview = live_text if len(live_text) <= 60 else live_text[:57] + "..."
         print(f"[caption-overlay] --demo: SHOW {len(rows)} row(s), live={preview!r}, "
               f"alphas={tuple(round(a, 2) for a in alphas)}, font_size={font_size:.1f}, "
               f"cx_frac={geometry.cx_frac:.3f}, bottom_px={geometry.bottom_px:.1f}")
-        return real_show(rows, alphas, font_size, geometry, decor=decor)
+        return real_show(rows, alphas, font_size, geometry, decor=decor, scroll_frac=scroll_frac)
 
     def _hide_and_log():
         # Fires both from tick()'s idle-timeout branch (mid-script -- see
@@ -3083,7 +3133,7 @@ def _run_demo(font_size, hold_sec=0.0, debug_input=False, position=None):
                       "so you can try the interactions by hand: hover the panel to expand "
                       "history (collapses back to just the live line the instant the cursor "
                       "leaves), plain scroll while hovering to scroll through history (older "
-                      "is up; auto-returns to live 10s after you stop scrolling), Cmd+scroll "
+                      "is down, like Messages; auto-returns to live 10s after you stop scrolling), Cmd+scroll "
                       "to resize the caption font, and drag the panel to move it anywhere on "
                       "screen. If you don't touch it, it idle-hides on its own after 5s -- "
                       "that's correct behavior, not a bug. Ctrl-C to exit early.")
