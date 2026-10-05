@@ -270,6 +270,24 @@ try:
     assert abs((anchor.top - anchor.header_height - label_top) * anchor.scale - 2) < .01
     assert abs((label_bottom - expanded[1]) * anchor.scale - 4) < .01
     capture("expanded")
+    # Native mouse events resize the expanded body while it stays centered.
+    def post(kind, x, y):
+        event = AppKit.NSEvent.mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure_(
+            kind, AppKit.NSMakePoint(x, y), 0, time.monotonic(), c.renderer.panel.windowNumber(),
+            None, 1, 1, 1.0)
+        AppKit.NSApplication.sharedApplication().postEvent_atStart_(event, False)
+    post(AppKit.NSEventTypeLeftMouseDown, 5, 10)
+    pump(.05)
+    assert c._width_resize_base is not None
+    post(AppKit.NSEventTypeLeftMouseDragged, -25, 10)
+    pump(.05)
+    post(AppKit.NSEventTypeLeftMouseUp, -25, 10)
+    pump(.05)
+    resized = frame()
+    assert resized[2] == expanded[2] + 60
+    assert resized[0] + resized[2] / 2 == expanded[0] + expanded[2] / 2
+    assert c.geometry.island_width == expanded[2] + 60
+    capture("resized")
     # Hovering changes only the actions: neither the centered text rectangle
     # nor the wrapping/row geometry may move, including when history is shown.
     def text_frames():

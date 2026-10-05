@@ -273,11 +273,13 @@ class OverlayGeometry:
     flag used to set unconditionally; now just that value's first-run
     default (see _OverlayController.__init__)."""
 
-    def __init__(self, cx_frac=0.5, bottom_px=24.0, font_size=28.0, position="free"):
+    def __init__(self, cx_frac=0.5, bottom_px=24.0, font_size=28.0, position="free",
+                 island_width=640.0):
         self.cx_frac = cx_frac
         self.bottom_px = bottom_px
         self.font_size = font_size
         self.position = position
+        self.island_width = island_width
 
     @property
     def top_anchored(self):
@@ -311,7 +313,8 @@ class OverlayGeometry:
 
     def as_dict(self):
         return {"cx_frac": self.cx_frac, "bottom_px": self.bottom_px,
-                "font_size": self.font_size, "position": self.position}
+                "font_size": self.font_size, "position": self.position,
+                "island_width": self.island_width}
 
     @classmethod
     def from_dict(cls, d):
@@ -323,17 +326,26 @@ class OverlayGeometry:
         hand-edited/corrupt settings file."""
         if not isinstance(d, dict):
             d = {}
-        defaults = {"cx_frac": 0.5, "bottom_px": 24.0, "font_size": 28.0}
-        ranges = {"cx_frac": (0.0, 1.0), "bottom_px": (0.0, math.inf), "font_size": (12.0, 96.0)}
+        defaults = {"cx_frac": 0.5, "bottom_px": 24.0, "font_size": 28.0,
+                    "island_width": 640.0}
+        ranges = {"cx_frac": (0.0, 1.0), "bottom_px": (0.0, math.inf),
+                  "font_size": (12.0, 96.0), "island_width": (280.0, math.inf)}
 
         def _field(key):
             val = d.get(key, defaults[key])
             if isinstance(val, bool) or not isinstance(val, (int, float)):
                 val = defaults[key]
+            try:
+                val = float(val)
+            except OverflowError:
+                val = defaults[key]
+            if not math.isfinite(val):
+                val = defaults[key]
             lo, hi = ranges[key]
-            return max(lo, min(hi, float(val)))
+            return max(lo, min(hi, val))
 
         geometry = cls(cx_frac=_field("cx_frac"), bottom_px=_field("bottom_px"), font_size=_field("font_size"))
+        geometry.island_width = _field("island_width")
         position = d.get("position", "free")
         geometry.set_position(position if position in CAPTION_POSITIONS else "free")
         return geometry
@@ -589,6 +601,18 @@ def _get_scrollable_container_view_class():
             def hitTest_(self, point):
                 hit = objc.super(_CaptionStackContainerView, self).hitTest_(point)
                 return self if hit is not None else None
+
+            def resetCursorRects(self):
+                objc.super(_CaptionStackContainerView, self).resetCursorRects()
+                if not getattr(self, "resize_edges_enabled", False):
+                    return
+                bounds = self.bounds()
+                body_height = max(0.0, bounds.size.height - self.resize_header_height)
+                if body_height:
+                    cursor = AppKit.NSCursor.resizeLeftRightCursor()
+                    self.addCursorRect_cursor_(AppKit.NSMakeRect(0, 0, 12, body_height), cursor)
+                    self.addCursorRect_cursor_(AppKit.NSMakeRect(
+                        bounds.size.width - 12, 0, 12, body_height), cursor)
 
             def scrollWheel_(self, event):
                 if getattr(self, "debug_input", False):
@@ -978,7 +1002,32 @@ def _island_anchor(screen):
     return IslandAnchor(center, top, width, height, frame.size.width, max(1.0, scale))
 
 
-def _island_layout(row_sizes, font_size, hover_row, anchor, scroll_frac=0.0):
+def _island_width_limits(anchor):
+    """Keep the caption wide enough for the camera and inside this display."""
+    maximum = max(280.0, anchor.screen_width * _MAX_WIDTH_FRACTION)
+    minimum = min(max(400.0, anchor.camera_width + 160.0), maximum)
+    return minimum, maximum
+
+
+def _island_display_width(anchor, geometry):
+    minimum, maximum = _island_width_limits(anchor)
+    return max(minimum, min(maximum, geometry.island_width))
+
+
+def _island_resize_edge(point, frame, header_height, grip=12.0):
+    """The left or right border below the camera, away from top controls."""
+    x, y, width, height = frame
+    if not (y <= point[1] < y + height - header_height):
+        return None
+    if x <= point[0] < x + grip:
+        return "left"
+    if x + width - grip <= point[0] < x + width:
+        return "right"
+    return None
+
+
+def _island_layout(row_sizes, font_size, hover_row, anchor, scroll_frac=0.0,
+                   geometry=None):
     """One continuous surface from screen top, with text below the housing.
 
     No rows means the compact island: only safe left/right status wings.
@@ -988,12 +1037,14 @@ def _island_layout(row_sizes, font_size, hover_row, anchor, scroll_frac=0.0):
         width = max(160.0, anchor.camera_width + 96.0)
         height = anchor.header_height + (6.0 if anchor.attached else 0.0)
         return (anchor.center_x - width / 2, anchor.top - height, width, height), [], []
+    if geometry is None:
+        geometry = OverlayGeometry(position="notch")
     reserve = _icon_reserve_for(font_size)[1]
-    min_width = max(400.0, anchor.camera_width + 160.0)
+    full_width = _island_display_width(anchor, geometry)
     # Reserve action space on BOTH sides, even when icons are hidden. The
     # caption then stays centered in the island with the same wrap width.
-    padded = [(text, max(w, min_width - 2 * reserve - 2 * _PAD_X), h)
-              for text, w, h in row_sizes]
+    text_width = max(10.0, full_width - 2 * reserve - 2 * _PAD_X)
+    padded = [(text, text_width, h) for text, _w, h in row_sizes]
     visible = SimpleNamespace(
         origin=SimpleNamespace(x=anchor.center_x - anchor.screen_width / 2, y=0),
         size=SimpleNamespace(width=anchor.screen_width,
@@ -1724,7 +1775,7 @@ class _IslandSurface:
         self.anchor = _island_anchor(screen)
         anchor = self.anchor
         decor = decor or RowDecor()
-        max_width = max(10.0, min(640.0, anchor.screen_width * _MAX_WIDTH_FRACTION)
+        max_width = max(10.0, _island_display_width(anchor, geometry)
                         - 2 * _PAD_X - 2 * _icon_reserve_for(font_size)[1])
         labels, sizes = [], []
         for text, _live in rows:
@@ -1733,7 +1784,7 @@ class _IslandSurface:
             labels.append(label)
             sizes.append((text, w, h))
         target, chips, boxes = _island_layout(sizes, font_size, decor.hover_row, anchor,
-                                              scroll_frac=scroll_frac)
+                                              scroll_frac=scroll_frac, geometry=geometry)
         was_visible = self.panel.isVisible()
         was_compact = self.compact
         old_frame = self.panel.frame()
@@ -1769,6 +1820,8 @@ class _IslandSurface:
         self.right_status.level = self.audio_level
         self.content.addSubview_(self.right_status)
         self.content.control_views = []
+        self.content.resize_edges_enabled = bool(rows)
+        self.content.resize_header_height = anchor.header_height
         if rows:
             close, corners = _overlay_controls((0, 0, target[2], target[3]))
             for rect, kind in [(close, "close"), *[(r, "scale") for r in corners.values()]]:
@@ -1831,6 +1884,7 @@ class _IslandSurface:
         for view, frame in zip(self.content.control_views, [close, *corners.values()]):
             view.setFrame_(AppKit.NSMakeRect(*frame))
         self.content.setNeedsDisplay_(True)
+        self.panel.invalidateCursorRectsForView_(self.content)
         self.panel.displayIfNeeded()
 
 
@@ -1898,6 +1952,7 @@ class _AppKitRenderer:
         if self.island is not None:
             self.island.stop()
             self.island = None
+        self.content.resize_edges_enabled = False
         boxes = _layout_stack(self.panel, self.content, rows, alphas, font_size, geometry,
                               decor=decor, scroll_frac=scroll_frac)
         return boxes
@@ -2182,6 +2237,7 @@ class _OverlayController:
         self._dragging = False
         self._drag_base = None
         self._resize_base = None
+        self._width_resize_base = None
         self._dismissed = False
         self._pinned = False
         self._close_hovered = False
@@ -2225,7 +2281,8 @@ class _OverlayController:
         g = self.geometry
         screen_state = getattr(self.renderer, "screen_state", None)
         return base + (round(g.font_size, 2), round(g.cx_frac, 4), round(g.bottom_px, 1),
-                       g.position, screen_state(g) if screen_state else None)
+                       g.position, round(g.island_width, 1),
+                       screen_state(g) if screen_state else None)
 
     def _handle_scroll_wheel(self, event):
         if _is_command_scroll(event):
@@ -2339,6 +2396,16 @@ class _OverlayController:
                     self._resize_base = (mouse, corner, self.geometry.font_size, control_frame)
                     self._dragging = True
                     return
+            if self.geometry.top_anchored:
+                screen_state = getattr(self.renderer, "screen_state", None)
+                anchor = screen_state(self.geometry) if screen_state else None
+                if isinstance(anchor, IslandAnchor):
+                    edge = _island_resize_edge(mouse, control_frame, anchor.header_height)
+                    if edge is not None:
+                        self._width_resize_base = (
+                            mouse[0], _island_display_width(anchor, self.geometry), edge, anchor)
+                        self._dragging = True
+                        return
         box = _hit_icon(mouse, self._row_boxes)
         translate_box = _hit_translate_icon(mouse, self._row_boxes) if box is None else None
         if self._debug_input:
@@ -2507,6 +2574,15 @@ class _OverlayController:
         self._settings_dirty_at = time.monotonic()
 
     def _handle_mouse_drag(self, event):
+        if self._width_resize_base is not None:
+            start_x, start_width, edge, anchor = self._width_resize_base
+            dx = self._click_point(event)[0] - start_x
+            minimum, maximum = _island_width_limits(anchor)
+            width = start_width + (2 * dx if edge == "right" else -2 * dx)
+            self.geometry.island_width = max(minimum, min(maximum, width))
+            self._settings_dirty_at = time.monotonic()
+            self.tick()
+            return
         if self._resize_base is not None:
             self._resize_to(self._click_point(event))
             self.tick()
@@ -2564,6 +2640,7 @@ class _OverlayController:
         self._dragging = False
         self._drag_base = None
         self._resize_base = None
+        self._width_resize_base = None
         if was_dragging and self.settings_path is not None:
             save_geometry(self.settings_path, self.geometry)
             self._settings_dirty_at = None

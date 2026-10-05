@@ -1100,8 +1100,10 @@ alwayswhisper live --demo                     # no microphone/model; meter stays
 preferred when an external display is attached; without a notch the island
 sits below the menu bar. Hover to read recent history, scroll to browse older
 captions, and use Command-scroll or the resize handle to change text size.
+Drag either side of the expanded caption area to adjust its width; the island
+stays centered on the notch, and the width is saved for the next run.
 Click the island to keep it open, and click × to collapse it. The legacy `free`
-mode remains draggable. Position and font size are saved in
+mode remains draggable. Position, text size, and island width are saved in
 `~/.config/alwayswhisper/caption_overlay.json`; an explicit placement flag wins
 over the saved setting. Reduced Motion disables the open/close morph.
 
