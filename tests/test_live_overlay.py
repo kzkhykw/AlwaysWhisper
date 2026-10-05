@@ -641,13 +641,16 @@ def test_overlay_geometry_scale_by_clamps_at_12_lower_bound():
 
 
 def test_overlay_geometry_as_dict_roundtrips_through_from_dict():
-    g = co.OverlayGeometry(cx_frac=0.3, bottom_px=50.0, font_size=40.0)
+    g = co.OverlayGeometry(cx_frac=0.3, bottom_px=50.0, font_size=40.0,
+                           island_width=720.0)
     d = g.as_dict()
-    assert d == {"cx_frac": 0.3, "bottom_px": 50.0, "font_size": 40.0, "position": "free"}
+    assert d == {"cx_frac": 0.3, "bottom_px": 50.0, "font_size": 40.0,
+                 "position": "free", "island_width": 720.0}
     g2 = co.OverlayGeometry.from_dict(d)
     assert g2.cx_frac == 0.3
     assert g2.bottom_px == 50.0
     assert g2.font_size == 40.0
+    assert g2.island_width == 720.0
 
 
 def test_overlay_geometry_from_dict_non_dict_input_returns_defaults():
@@ -663,6 +666,7 @@ def test_overlay_geometry_from_dict_missing_keys_fall_back_to_defaults_per_field
     assert g.cx_frac == 0.1
     assert g.bottom_px == 24.0     # missing -> default
     assert g.font_size == 28.0     # missing -> default
+    assert g.island_width == 640.0  # older settings files remain usable
 
 
 def test_overlay_geometry_from_dict_non_numeric_values_fall_back_to_defaults():
@@ -3377,6 +3381,55 @@ def test_island_compact_and_expanded_share_physical_screen_top():
         assert y + h == 1169  # not safe-area bottom / visibleFrame.top
     assert expanded[2] > compact[2] and expanded[3] > compact[3]
     assert rows[0].frame[1] + rows[0].frame[3] <= 1169 - 38
+
+
+def test_island_caption_width_is_fixed_for_short_and_long_text():
+    anchor = co.IslandAnchor(900, 1169, 220, 38, 1800)
+    geometry = co.OverlayGeometry(position="notch", island_width=700)
+    widths = [co._island_layout([(text, measured_width, 34)], 28, None, anchor,
+                                geometry=geometry)[0][2]
+              for text, measured_width in (("短い", 50), ("long caption", 480))]
+    assert widths == [700, 700]
+
+
+def test_island_width_clamps_to_screen_and_camera():
+    anchor = co.IslandAnchor(756, 982, 220, 32, 1512)
+    assert co._island_display_width(anchor, co.OverlayGeometry(island_width=100)) == 400
+    assert co._island_display_width(anchor, co.OverlayGeometry(island_width=5000)) == pytest.approx(1512 * .92)
+
+
+def test_island_resize_edge_only_hits_body_borders():
+    frame = (100, 200, 640, 90)
+    assert co._island_resize_edge((105, 220), frame, 38) == "left"
+    assert co._island_resize_edge((735, 220), frame, 38) == "right"
+    assert co._island_resize_edge((105, 270), frame, 38) is None
+    assert co._island_resize_edge((200, 220), frame, 38) is None
+
+
+@pytest.mark.parametrize("edge,start_x,drag_dx", [("left", 105, -40), ("right", 735, 40)])
+def test_island_edge_drag_resizes_and_persists(edge, start_x, drag_dx, tmp_path):
+    anchor = co.IslandAnchor(420, 982, 220, 38, 840)
+    renderer = _FakeRendererWithBoxes([co.RowBox(0, "字幕", (100, 200, 640, 52))])
+    renderer.control_frame = (100, 200, 640, 90)
+    renderer.screen_state = lambda geometry: anchor
+    path = tmp_path / "geometry.json"
+    controller = co._OverlayController(_FakeDisplayQueue([("chunk", "字幕")]),
+                                       renderer=renderer, settings_path=path,
+                                       position="notch")
+    mouse = [-9999, -9999]
+    controller._mouse_location = lambda: tuple(mouse)
+    controller.tick(now=0)
+    mouse[:] = [start_x, 220]
+    controller._handle_mouse_down(None)
+    assert controller._width_resize_base[2] == edge
+    assert controller._drag_base is None
+    mouse[0] += drag_dx
+    controller._handle_mouse_drag(None)
+    assert controller.geometry.island_width == 720
+    assert renderer.calls[-1][4].island_width == 720
+    controller._handle_mouse_up(None)
+    assert controller._width_resize_base is None
+    assert co.load_geometry(path).island_width == 720
 
 
 def test_island_animation_keeps_camera_covered_and_stays_between_endpoints():
