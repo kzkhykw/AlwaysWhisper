@@ -12,10 +12,15 @@ import queue
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
+from functools import partial
 from types import SimpleNamespace
 
 from . import translator   # stdlib-only sibling module; safe to import headlessly
+from . import live_input  # AppKit and Accessibility are loaded only after Live Input is enabled
+from .transcription_modes import (LANGUAGE_MODES, TRANSLATION_MODES, MODE_LABELS,
+                                 MODE_DESCRIPTIONS, next_language_mode)
 
 
 # ============================================================= pure logic ===
@@ -40,6 +45,12 @@ class CaptionLineModel:
       ("eos",) -- the current segment's display output is complete. Does
         NOT clear the text -- it stays on screen, unchanged, until
         idle_clear_sec has elapsed with no further event (see visible_at).
+      ("replace", text) -- overwrite the live line with `text` without
+        appending and without pushing the previous live text into history.
+        Used when a later ASR correction arrives for the utterance already
+        on screen. Empty/missing text, or a replace before any live text
+        exists, is ignored. Does not change `_ended`. Optional third fields
+        on chunk/replace carry an utterance ID; a stale replacement is ignored.
 
     No length limit and no trimming on the live line's text: it always
     accumulates in full, however long it gets (user decision -- long
@@ -54,8 +65,8 @@ class CaptionLineModel:
     unless `expanded` is True (the caller passes its current hover/drag
     state -- see _OverlayController.tick) or the effective scroll offset is
     > 0 (the user just scrolled). Either way it EXPANDS to exactly the old
-    always-on look: the newest HISTORY_WINDOW (2) history rows above the
-    pinned live row.
+    always-on look: the newest history_window rows above the pinned live
+    row (2 by default; the notch height can increase it).
 
     Scrollback (Apple Live Captions-style, only reachable while expanded):
     scroll_by(row_delta, now) moves a scroll OFFSET (positive = further
@@ -83,11 +94,13 @@ class CaptionLineModel:
     def __init__(self, idle_clear_sec=5.0):
         self.idle_clear_sec = idle_clear_sec
         self._text = ""
+        self._utterance_id = None
         self._ended = True          # nothing has started yet -> next chunk starts fresh
         self._last_event_at = None  # monotonic time of the last event, or None if none yet
         self._history = []          # oldest -> newest, capped at HISTORY_CAP
         self._offset = 0.0          # raw scroll offset: rows back from live (0 = at the live edge)
         self._last_scroll_at = None  # monotonic time of the last scroll_by(), or None if never scrolled
+        self.history_window = self.HISTORY_WINDOW
 
     def apply(self, event, now):
         """Advance the model by one event. `now` is the caller's monotonic
@@ -96,6 +109,7 @@ class CaptionLineModel:
         kind = event[0]
         if kind == "chunk":
             text = event[1]
+            utterance_id = event[2] if len(event) > 2 else None
             # A fresh line starts not only right after an eos, but also if
             # the line had already gone invisible from an idle timeout with
             # no eos ever seen (a stalled/never-finished segment) -- either
@@ -104,7 +118,8 @@ class CaptionLineModel:
             # version, push whatever the live line WAS onto history first
             # (only if it's non-empty: the very first chunk ever, or one
             # right after __init__, has nothing to push).
-            fresh = self._ended or not self._live_visible_at(now)
+            fresh = (self._ended or not self._live_visible_at(now)
+                     or utterance_id != self._utterance_id)
             if fresh:
                 if self._text:
                     self._history.append(self._text)
@@ -113,8 +128,16 @@ class CaptionLineModel:
             else:
                 self._text = self._text + text
             self._ended = False
+            self._utterance_id = utterance_id
         elif kind == "eos":
             self._ended = True
+        elif kind == "replace":
+            if len(event) > 2 and event[2] != self._utterance_id:
+                return  # a delayed fix must never overwrite a newer utterance
+            new = event[1] if len(event) > 1 else ""
+            if not isinstance(new, str) or not new or not self._text:
+                return
+            self._text = new
         else:
             return  # unrecognized event kind: ignore rather than crash the UI poll loop
         self._last_event_at = now
@@ -144,6 +167,12 @@ class CaptionLineModel:
         """Public accessor for the current effective scroll offset (0 = at
         the live edge, i.e. showing the newest history + live)."""
         return self._effective_offset(now)
+
+    def set_history_window(self, count):
+        self.history_window = max(0, min(self.HISTORY_CAP, int(count)))
+        max_offset = (max(0, len(self._history) - self.history_window)
+                      if self.history_window else 0)
+        self._offset = min(self._offset, max_offset)
 
     def visible_at(self, now, hold=False):
         """Whether the panel (collapsed live row, or expanded whole stack --
@@ -179,7 +208,7 @@ class CaptionLineModel:
         EXPANDED -- `expanded` is True, or the effective scroll offset is
         > 0 (scroll_by() was just used, even if the cursor has since left
         the panel -- matches what's still on screen mid-auto-return) --
-        exactly the pre-collapse behavior: up to HISTORY_WINDOW (2) history
+        exactly the pre-collapse behavior: up to history_window history
         rows, the window scroll_by()'s offset selects (shifting toward
         older entries as the offset grows), THEN the live row, always
         last, always present (pinned at the bottom regardless of scroll
@@ -195,7 +224,7 @@ class CaptionLineModel:
         o = self._effective_offset(now)
         floor_o = int(math.floor(o))
         extra = 1 if (o - floor_o) > 1e-6 else 0
-        start = max(0, n - self.HISTORY_WINDOW - extra - floor_o)
+        start = max(0, n - self.history_window - extra - floor_o)
         end = n - floor_o
         window = self._history[start:end]
         return [(t, False) for t in window] + [(self._text, True)]
@@ -214,7 +243,8 @@ class CaptionLineModel:
         already snapped back to live once auto-return's 10s elapsed).
         Always records `now` as the last-scroll time, restarting the
         auto-return countdown."""
-        max_offset = max(0, len(self._history) - self.HISTORY_WINDOW)
+        max_offset = (max(0, len(self._history) - self.history_window)
+                      if self.history_window else 0)
         start = self._effective_offset(now)
         offset = max(0.0, min(float(max_offset), start + row_delta))
         self._offset = 0.0 if offset < 1e-6 else offset
@@ -274,12 +304,13 @@ class OverlayGeometry:
     default (see _OverlayController.__init__)."""
 
     def __init__(self, cx_frac=0.5, bottom_px=24.0, font_size=28.0, position="free",
-                 island_width=640.0):
+                 island_width=640.0, island_height=0.0):
         self.cx_frac = cx_frac
         self.bottom_px = bottom_px
         self.font_size = font_size
         self.position = position
         self.island_width = island_width
+        self.island_height = island_height  # 0 keeps the content-sized default
 
     @property
     def top_anchored(self):
@@ -314,7 +345,7 @@ class OverlayGeometry:
     def as_dict(self):
         return {"cx_frac": self.cx_frac, "bottom_px": self.bottom_px,
                 "font_size": self.font_size, "position": self.position,
-                "island_width": self.island_width}
+                "island_width": self.island_width, "island_height": self.island_height}
 
     @classmethod
     def from_dict(cls, d):
@@ -327,9 +358,10 @@ class OverlayGeometry:
         if not isinstance(d, dict):
             d = {}
         defaults = {"cx_frac": 0.5, "bottom_px": 24.0, "font_size": 28.0,
-                    "island_width": 640.0}
+                    "island_width": 640.0, "island_height": 0.0}
         ranges = {"cx_frac": (0.0, 1.0), "bottom_px": (0.0, math.inf),
-                  "font_size": (12.0, 96.0), "island_width": (280.0, math.inf)}
+                  "font_size": (12.0, 96.0), "island_width": (280.0, math.inf),
+                  "island_height": (0.0, math.inf)}
 
         def _field(key):
             val = d.get(key, defaults[key])
@@ -346,6 +378,7 @@ class OverlayGeometry:
 
         geometry = cls(cx_frac=_field("cx_frac"), bottom_px=_field("bottom_px"), font_size=_field("font_size"))
         geometry.island_width = _field("island_width")
+        geometry.island_height = _field("island_height")
         position = d.get("position", "free")
         geometry.set_position(position if position in CAPTION_POSITIONS else "free")
         return geometry
@@ -409,7 +442,7 @@ _MAX_WIDTH_FRACTION = 0.92    # panel width clamp, as a fraction of the screen's
 # shows a checkmark for COPY_FEEDBACK_SEC seconds as feedback (see tick()).
 # Copy puts the row's own text on the clipboard; translate (2026-09-03~)
 # puts its TRANSLATION there instead -- Japanese to English, anything else
-# to Japanese, via translator.py/OpenRouter. Because that one is a network
+# to Japanese, via translator.py (OpenRouter or Ollama). Because that is an HTTP
 # call it also has in-progress and failed states, which copy has no use for
 # (see RowDecor.translate_state / _make_translate_icon_view).
 COPY_FEEDBACK_SEC = 1.2
@@ -482,6 +515,7 @@ def _get_caption_panel_class():
     global _CaptionPanelClass
     if _CaptionPanelClass is None:
         import AppKit
+        import objc
 
         class _CaptionPanel(AppKit.NSPanel):
             def canBecomeKeyWindow(self):
@@ -489,6 +523,12 @@ def _get_caption_panel_class():
 
             def canBecomeMainWindow(self):
                 return False
+
+            def keyDown_(self, event):
+                callback = getattr(self, "on_key_down", None)
+                if callback is not None and callback(event):
+                    return
+                objc.super(_CaptionPanel, self).keyDown_(event)
 
         _CaptionPanelClass = _CaptionPanel
     return _CaptionPanelClass
@@ -613,6 +653,9 @@ def _get_scrollable_container_view_class():
                     self.addCursorRect_cursor_(AppKit.NSMakeRect(0, 0, 12, body_height), cursor)
                     self.addCursorRect_cursor_(AppKit.NSMakeRect(
                         bounds.size.width - 12, 0, 12, body_height), cursor)
+                    self.addCursorRect_cursor_(AppKit.NSMakeRect(
+                        12, 0, max(0.0, bounds.size.width - 24), 12),
+                        AppKit.NSCursor.resizeUpDownCursor())
 
             def scrollWheel_(self, event):
                 if getattr(self, "debug_input", False):
@@ -813,14 +856,16 @@ def _alphas_for(rows):
     """(alpha, ...) parallel to `rows` (oldest -> newest, live last -- see
     CaptionLineModel.visible_rows): _LIVE_ALPHA for the live row, and
     _HISTORY_ALPHAS_NEWEST_FIRST assigned to however many history rows are
-    actually present (0-3), aligned to the NEWEST (live-adjacent) end --
+    actually present, aligned to the NEWEST (live-adjacent) end --
     e.g. with only 2 history rows shown, they get (0.55, 0.75), not
     (0.75, 0.55): the OLDER of the two is "2 back" (0.55), not "1 back".
     Pure function, no AppKit -- unit-tested directly."""
     if not rows:
         return ()
     k = len(rows) - 1  # history rows shown = everything but the live row
-    return tuple(reversed(_HISTORY_ALPHAS_NEWEST_FIRST[:k])) + (_LIVE_ALPHA,)
+    history = [_HISTORY_ALPHAS_NEWEST_FIRST[min(i, len(_HISTORY_ALPHAS_NEWEST_FIRST) - 1)]
+               for i in range(k)]
+    return tuple(reversed(history)) + (_LIVE_ALPHA,)
 
 
 def _panel_origin(visible, panel_w, panel_h, geometry):
@@ -869,7 +914,8 @@ def _panel_origin(visible, panel_w, panel_h, geometry):
     return x, y
 
 
-def _drag_reposition_origin(visible, frame_w, frame_h, font_size, geometry):
+def _drag_reposition_origin(visible, frame_w, frame_h, font_size, geometry,
+                            left_action=False):
     """(x, y) to move the panel's frame origin to, LIVE, during a drag (see
     _OverlayController._handle_mouse_drag, the only caller -- it owns the
     real AppKit frame/screen reads and only hands this pure function
@@ -900,8 +946,11 @@ def _drag_reposition_origin(visible, frame_w, frame_h, font_size, geometry):
 
     Pure (no AppKit), unlike _handle_mouse_drag itself, which reads
     NSScreen/NSEvent/NSWindow directly and so cannot run headlessly."""
-    text_w = frame_w - _icon_reserve_for(font_size)[1]
-    return _panel_origin(visible, text_w, frame_h, geometry)
+    icon_size, right_reserve = _icon_reserve_for(font_size)
+    left_reserve = icon_size + _PAD_X if left_action else 0.0
+    text_w = frame_w - right_reserve - left_reserve
+    x, y = _panel_origin(visible, text_w, frame_h, geometry)
+    return x - left_reserve, y
 
 
 def _screen_for_panel(panel, fallback_screen):
@@ -1014,6 +1063,23 @@ def _island_display_width(anchor, geometry):
     return max(minimum, min(maximum, geometry.island_width))
 
 
+def _island_display_height(anchor, geometry):
+    if geometry.island_height <= 0:
+        return 0.0
+    return min(geometry.island_height, max(anchor.header_height, anchor.top - 40.0))
+
+
+def _island_history_window(geometry, anchor):
+    """History rows that fit the saved body height at the current font size."""
+    height = _island_display_height(anchor, geometry)
+    if height <= 0:
+        return CaptionLineModel.HISTORY_WINDOW
+    row_height = math.ceil(geometry.font_size * 1.2) + 2 * anchor.caption_padding + _ROW_GAP
+    body_height = max(0.0, height - anchor.header_height - 2.0 / anchor.scale)
+    return max(0, min(CaptionLineModel.HISTORY_CAP,
+                      int((body_height + _ROW_GAP) // row_height) - 1))
+
+
 def _island_resize_edge(point, frame, header_height, grip=12.0):
     """The left or right border below the camera, away from top controls."""
     x, y, width, height = frame
@@ -1026,21 +1092,29 @@ def _island_resize_edge(point, frame, header_height, grip=12.0):
     return None
 
 
+def _island_resize_bottom(point, frame, grip=12.0):
+    """The bottom border, excluding the left/right width grips."""
+    x, y, width, _height = frame
+    return x + grip <= point[0] < x + width - grip and y <= point[1] < y + grip
+
+
 def _island_layout(row_sizes, font_size, hover_row, anchor, scroll_frac=0.0,
-                   geometry=None):
+                   geometry=None, language_control=False):
     """One continuous surface from screen top, with text below the housing.
 
     No rows means the compact island: only safe left/right status wings.
     Caption text and history expand the SAME surface, not a second window.
     """
     if not row_sizes:
-        width = max(160.0, anchor.camera_width + 96.0)
+        width = max(160.0, anchor.camera_width + (224.0 if language_control else 96.0))
         height = anchor.header_height + (6.0 if anchor.attached else 0.0)
         return (anchor.center_x - width / 2, anchor.top - height, width, height), [], []
     if geometry is None:
         geometry = OverlayGeometry(position="notch")
     reserve = _icon_reserve_for(font_size)[1]
     full_width = _island_display_width(anchor, geometry)
+    if language_control:
+        full_width = max(full_width, anchor.camera_width + 224.0)
     # Reserve action space on BOTH sides, even when icons are hidden. The
     # caption then stays centered in the island with the same wrap width.
     text_width = max(10.0, full_width - 2 * reserve - 2 * _PAD_X)
@@ -1051,7 +1125,12 @@ def _island_layout(row_sizes, font_size, hover_row, anchor, scroll_frac=0.0,
                              height=anchor.top - anchor.header_height))
     rect, chips, boxes = _compute_layout(padded, font_size, hover_row, visible,
                                         OverlayGeometry(position="notch"), pad_y=anchor.caption_padding,
-                                        scroll_frac=scroll_frac)
+                                        scroll_frac=scroll_frac,
+                                        history_window=_island_history_window(geometry, anchor),
+                                        viewport_height=(max(_island_display_height(anchor, geometry) - anchor.header_height
+                                                             - 2.0 / anchor.scale,
+                                                             row_sizes[-1][2] + 2 * anchor.caption_padding)
+                                                         if geometry.island_height > 0 else None))
     x, y, w, h = rect
     # Whole-point, even width prevents NSWindow's frame rounding from starting
     # another tiny resize (and nudging text) when only the hover state changes.
@@ -1070,6 +1149,19 @@ def _island_layout(row_sizes, font_size, hover_row, anchor, scroll_frac=0.0,
                     shifted(box.icon, icon_screen_dx), shifted(box.translate_icon, icon_screen_dx))
              for box in boxes]
     return (x, y - bottom_extra, w, h + anchor.header_height + bottom_extra), chips, boxes
+
+
+def _island_live_input_rect(frame, anchor):
+    """Header pencil, clear of the camera and the expanded close button."""
+    x, y, w, h = frame
+    wing_width = (w - anchor.camera_width) / 2
+    inset = max(8.0, min(36.0, (wing_width - 20) / 2))
+    return (x + inset, y + h - anchor.header_height / 2 - 10, 20, 20)
+
+
+def _island_language_rect(frame, anchor):
+    x, y, w, h = _island_live_input_rect(frame, anchor)
+    return (x + w + 4, y, 48, h)
 
 
 def _island_tween(start, target, progress):
@@ -1113,6 +1205,7 @@ class RowBox:
     frame: tuple
     icon: tuple = None
     translate_icon: tuple = None
+    live_input_icon: tuple = None
 
 
 @dataclass(frozen=True)
@@ -1137,6 +1230,10 @@ class RowDecor:
     copied_text: str = None
     translate_text: str = None
     translate_state: str = None
+    live_input_active: bool = False
+    live_input_error: bool = False
+    language: str = None
+    language_pending: bool = False
 
 
 def _point_in_rect(point, rect):
@@ -1182,6 +1279,13 @@ def _hit_translate_icon(point, boxes):
     return None
 
 
+def _hit_live_input_icon(point, boxes):
+    for box in boxes:
+        if box.live_input_icon is not None and _point_in_rect(point, box.live_input_icon):
+            return box
+    return None
+
+
 def _icon_reserve_for(font_size):
     """(icon_size, icon_reserve) for `font_size` -- icon_size scales with
     the caption font (bigger captions, bigger icons) but is clamped to
@@ -1202,7 +1306,8 @@ def _icon_reserve_for(font_size):
 
 
 def _compute_layout(row_sizes, font_size, hover_row, visible_frame, geometry, *,
-                    pad_y=_PAD_Y, scroll_frac=0.0, history_window=None):
+                    pad_y=_PAD_Y, scroll_frac=0.0, history_window=None,
+                    left_action=False, viewport_height=None):
     """Pure layout math for the caption stack (no AppKit) -- split out of
     _layout_stack so the hover copy-icon geometry has direct unit test
     coverage without a real WindowServer. `row_sizes` is [(text, text_w,
@@ -1217,7 +1322,8 @@ def _compute_layout(row_sizes, font_size, hover_row, visible_frame, geometry, *,
     Returns (panel_rect, chip_layouts, row_boxes):
       panel_rect = (x, y, w, h), SCREEN coords, AppKit bottom-left-origin
         frame convention (see _panel_origin) -- w is ALWAYS
-        text_panel_w + icon_reserve (see _icon_reserve_for), even with
+        text_panel_w + icon_reserve (plus the Live Input reserve when
+        left_action=True), even with
         hover_row=None: the frame itself never resizes the instant
         hovering starts/stops (the extra strip is simply invisible against
         the panel's own transparent background until an icon is actually
@@ -1275,6 +1381,7 @@ def _compute_layout(row_sizes, font_size, hover_row, visible_frame, geometry, *,
     earlier (older) row stacked above it -- but RowBox.index still matches
     row_sizes' own oldest-first order, not the render/stacking order."""
     icon_size, icon_reserve = _icon_reserve_for(font_size)
+    left_reserve = icon_size + _PAD_X if left_action else 0.0
 
     if not row_sizes:
         x, y = _panel_origin(visible_frame, 0.0, 0.0, geometry)
@@ -1283,7 +1390,7 @@ def _compute_layout(row_sizes, font_size, hover_row, visible_frame, geometry, *,
     text_sizes = [(w + 2 * _PAD_X, h + 2 * pad_y) for _text, w, h in row_sizes]
     if geometry.top_anchored:
         # One centered black surface, including a stable reserve for actions.
-        width = max(280.0, max(w for w, _h in text_sizes))
+        width = max(w for w, _h in text_sizes)
         text_sizes = [(width, h) for _w, h in text_sizes]
     text_panel_w = max(w for w, _h in text_sizes)
     n = len(row_sizes)
@@ -1299,11 +1406,18 @@ def _compute_layout(row_sizes, font_size, hover_row, visible_frame, geometry, *,
         shift = frac * (text_sizes[n_extra - 1][1] + _ROW_GAP)
     panel_h = sum(h for _w, h in text_sizes) + _ROW_GAP * (len(text_sizes) - 1)
     panel_h -= extra_block_h
-    panel_w = text_panel_w + icon_reserve   # ALWAYS reserved -- see docstring above
+    if viewport_height is not None:
+        # The island's bottom edge follows the pointer point-for-point. If
+        # wrapped history exceeds the viewport, it clips at the camera end;
+        # the live caption remains anchored at the bottom and fully visible.
+        panel_h = max(float(viewport_height), text_sizes[-1][1])
+    panel_w = text_panel_w + icon_reserve + left_reserve
 
     ox, oy = _panel_origin(visible_frame,
                            panel_w if geometry.top_anchored else text_panel_w,
                            panel_h, geometry)
+    if not geometry.top_anchored:
+        ox -= left_reserve  # the text stack keeps its previous screen position
 
     y_positions = [0.0] * n
     y_cursor = 0.0
@@ -1320,12 +1434,13 @@ def _compute_layout(row_sizes, font_size, hover_row, visible_frame, geometry, *,
     row_boxes = []
     for i, (text, _tw, _th) in enumerate(row_sizes):
         text_w, chip_h = text_sizes[i]
-        chip_x = (text_panel_w - text_w) / 2.0
+        text_x = left_reserve + (text_panel_w - text_w) / 2.0
+        chip_x = text_x - left_reserve if i == hover_row else text_x
         chip_y = y_positions[i]
 
         # RowBox.frame ALWAYS reserves the icon extension, independent of
         # hover_row -- see docstring above.
-        hit_frame_w = text_w + icon_reserve
+        hit_frame_w = text_w + icon_reserve + left_reserve
 
         if i == hover_row:
             # Icon VIEWS: two tight icon_size squares, the first starting
@@ -1334,34 +1449,39 @@ def _compute_layout(row_sizes, font_size, hover_row, visible_frame, geometry, *,
             # later -- balanced text / _PAD_X / copy / _ICON_GAP /
             # translate / _PAD_X / chip-edge (see _icon_reserve_for).
             icon_y = (chip_h - icon_size) / 2.0
-            icon_view_local = (text_w, icon_y, icon_size, icon_size)
-            translate_view_local = (text_w + icon_size + _ICON_GAP, icon_y, icon_size, icon_size)
-            render_w = text_w + icon_reserve
+            icon_view_local = (text_w + left_reserve, icon_y, icon_size, icon_size)
+            translate_view_local = (text_w + left_reserve + icon_size + _ICON_GAP,
+                                    icon_y, icon_size, icon_size)
+            render_w = text_w + icon_reserve + left_reserve
             # Icon HIT rects: deliberately more generous than the views --
             # full chip height, together tiling the whole strip from half a
             # padding INTO the text's own right padding through the widened
             # chip's right edge, split at the MIDPOINT of the gap between
             # the two icons so neither can swallow the other's clicks and
             # no point in the strip belongs to neither.
-            icon_hit_x = text_w - _PAD_X / 2.0
-            split_x = text_w + icon_size + _ICON_GAP / 2.0
+            icon_hit_x = text_w + left_reserve - _PAD_X / 2.0
+            split_x = text_w + left_reserve + icon_size + _ICON_GAP / 2.0
             icon_hit_screen = (ox + chip_x + icon_hit_x, oy + chip_y, split_x - icon_hit_x, chip_h)
             translate_hit_screen = (ox + chip_x + split_x, oy + chip_y,
-                                     (text_w + icon_reserve) - split_x, chip_h)
+                                     (text_w + left_reserve + icon_reserve) - split_x, chip_h)
+            live_input_hit = ((ox + chip_x, oy + chip_y, left_reserve, chip_h)
+                              if left_action else None)
         else:
             icon_view_local = None
             translate_view_local = None
             render_w = text_w
             icon_hit_screen = None
             translate_hit_screen = None
+            live_input_hit = None
 
         chip_layouts.append((chip_x, chip_y, render_w, chip_h, icon_view_local, translate_view_local))
         row_boxes.append(RowBox(
             index=i,
             text=text,
-            frame=(ox + chip_x, oy + chip_y, hit_frame_w, chip_h),
+            frame=(ox + text_x - left_reserve, oy + chip_y, hit_frame_w, chip_h),
             icon=icon_hit_screen,
             translate_icon=translate_hit_screen,
+            live_input_icon=live_input_hit,
         ))
 
     return (ox, oy, panel_w, panel_h), chip_layouts, row_boxes
@@ -1486,6 +1606,7 @@ def _layout_stack(panel, content, rows, alphas, font_size, geometry, decor=None,
     if decor is None:
         decor = RowDecor()
 
+    content.live_input_views = []
     labels = []
     row_sizes = []  # (text, text_w, text_h), oldest -> newest, matching `rows`
     for (text, _is_live) in rows:
@@ -1496,7 +1617,7 @@ def _layout_stack(panel, content, rows, alphas, font_size, geometry, decor=None,
 
     panel_rect, chip_layouts, row_boxes = _compute_layout(
         row_sizes, font_size, decor.hover_row, visible, geometry,
-        scroll_frac=scroll_frac)
+        scroll_frac=scroll_frac, left_action=not geometry.top_anchored)
     panel_x, panel_y, panel_w, panel_h = panel_rect
 
     panel_h += _CONTROL_HEIGHT
@@ -1510,7 +1631,7 @@ def _layout_stack(panel, content, rows, alphas, font_size, geometry, decor=None,
         def shifted(rect):
             return (rect[0], rect[1] + delta_y, rect[2], rect[3]) if rect else None
         row_boxes = [RowBox(b.index, b.text, shifted(b.frame), shifted(b.icon),
-                            shifted(b.translate_icon)) for b in row_boxes]
+                            shifted(b.translate_icon), shifted(b.live_input_icon)) for b in row_boxes]
         panel_y = adjusted_y
 
     if geometry.top_anchored:
@@ -1521,16 +1642,26 @@ def _layout_stack(panel, content, rows, alphas, font_size, geometry, decor=None,
         background.attached_top = geometry.position == "notch"
         content.addSubview_(background)
 
-    for label, (text, text_w, text_h), chip_layout, alpha in zip(
-            labels, row_sizes, chip_layouts, alphas):
+    for index, (label, (text, text_w, text_h), chip_layout, alpha) in enumerate(zip(
+            labels, row_sizes, chip_layouts, alphas)):
         chip_x, chip_y, chip_w, chip_h, icon_rect, translate_rect = chip_layout
         chip = _get_rounded_background_view_class().alloc().initWithFrame_(
             AppKit.NSMakeRect(0, 0, chip_w, chip_h))
         chip.setAlphaValue_(alpha)
         if geometry.top_anchored:
             chip.background_alpha = 0.0
-        label.setFrame_(AppKit.NSMakeRect(_PAD_X, _PAD_Y, text_w, text_h))
+        left_reserve = (_icon_reserve_for(font_size)[0] + _PAD_X
+                        if index == decor.hover_row else 0.0)
+        label.setFrame_(AppKit.NSMakeRect(_PAD_X + left_reserve, _PAD_Y, text_w, text_h))
         chip.addSubview_(label)
+        if index == decor.hover_row:
+            icon_size = _icon_reserve_for(font_size)[0]
+            pencil_rect = ((left_reserve - icon_size) / 2, (chip_h - icon_size) / 2,
+                           icon_size, icon_size)
+            input_view = _make_live_input_icon_view(
+                pencil_rect, decor.live_input_active, decor.live_input_error)
+            chip.addSubview_(input_view)
+            content.live_input_views.append(input_view)
         if icon_rect is not None:
             icon_view = _make_copy_icon_view(icon_rect, checkmark=(decor.copied_text == text))
             chip.addSubview_(icon_view)
@@ -1676,6 +1807,59 @@ def _make_translate_icon_view(rect, state):
     return _make_icon_view(rect, symbol_name, description, fallback)
 
 
+_LiveInputDotsView = None
+_LIVE_INPUT_DOT_INTERVAL_SEC = 0.4
+
+
+def _make_live_input_dots_view(rect):
+    """Draw fixed-position dots so . → .. → ... never shifts the control."""
+    global _LiveInputDotsView
+    import AppKit
+    if _LiveInputDotsView is None:
+        class _CaptionLiveInputDotsView(AppKit.NSView):
+            def drawRect_(self, dirty):
+                bounds = self.bounds()
+                diameter = min(bounds.size.width, bounds.size.height) * .16
+                step = diameter * 1.9
+                left = (bounds.size.width - diameter - 2 * step) / 2
+                bottom = (bounds.size.height - diameter) / 2
+                AppKit.NSColor.colorWithCalibratedWhite_alpha_(1.0, .9).setFill()
+                for i in range(self.dot_count):
+                    AppKit.NSBezierPath.bezierPathWithOvalInRect_(AppKit.NSMakeRect(
+                        left + i * step, bottom, diameter, diameter)).fill()
+        _LiveInputDotsView = _CaptionLiveInputDotsView
+    view = _LiveInputDotsView.alloc().initWithFrame_(AppKit.NSMakeRect(*rect))
+    view.dot_count = 1
+    return view
+
+
+def _make_live_input_icon_view(rect, active=False, error=False):
+    if error:
+        symbol, label, fallback = "exclamationmark.triangle", "直接入力：権限・入力エラー", "!"
+    elif active:
+        label = "直接入力：オン（クリックでオフ）"
+    else:
+        symbol, label, fallback = "pencil", "直接入力：オフ（クリックでオン）", "✎"
+    view = (_make_live_input_dots_view(rect) if active and not error
+            else _make_icon_view(rect, symbol, label, fallback))
+    view.setToolTip_(label)
+    view.setAccessibilityLabel_(label)
+    return view
+
+
+def _make_language_view(rect, language, pending):
+    import AppKit
+    label = _make_row_label(10)
+    label.setFrame_(AppKit.NSMakeRect(*rect))
+    label.setStringValue_("…" if pending else MODE_LABELS.get(language, "AUTO"))
+    label.setFont_(AppKit.NSFont.systemFontOfSize_weight_(10, AppKit.NSFontWeightSemibold))
+    label.cell().setUsesSingleLineMode_(True)
+    label.cell().setWraps_(False)
+    label.setToolTip_("言語を切り替えています…" if pending else
+                      f"{MODE_DESCRIPTIONS.get(language, language)}（アイランドを選択して I で切り替え）")
+    return label
+
+
 _CaptionStatusTarget = None
 
 
@@ -1775,8 +1959,10 @@ class _IslandSurface:
         self.anchor = _island_anchor(screen)
         anchor = self.anchor
         decor = decor or RowDecor()
-        max_width = max(10.0, _island_display_width(anchor, geometry)
-                        - 2 * _PAD_X - 2 * _icon_reserve_for(font_size)[1])
+        display_width = _island_display_width(anchor, geometry)
+        if decor.language is not None:
+            display_width = max(display_width, anchor.camera_width + 224.0)
+        max_width = max(10.0, display_width - 2 * _PAD_X - 2 * _icon_reserve_for(font_size)[1])
         labels, sizes = [], []
         for text, _live in rows:
             label = _make_row_label(font_size)
@@ -1784,7 +1970,8 @@ class _IslandSurface:
             labels.append(label)
             sizes.append((text, w, h))
         target, chips, boxes = _island_layout(sizes, font_size, decor.hover_row, anchor,
-                                              scroll_frac=scroll_frac, geometry=geometry)
+                                              scroll_frac=scroll_frac, geometry=geometry,
+                                              language_control=decor.language is not None)
         was_visible = self.panel.isVisible()
         was_compact = self.compact
         old_frame = self.panel.frame()
@@ -1800,7 +1987,7 @@ class _IslandSurface:
         self.background.attached_top = anchor.attached
         self.content.addSubview_(self.background)
         self.body_views = []
-        for label, (_text, w, h), chip_layout, alpha in zip(labels, sizes, chips, alphas):
+        for index, (label, (_text, w, h), chip_layout, alpha) in enumerate(zip(labels, sizes, chips, alphas)):
             cx, cy, cw, ch, icon_rect, translate_rect = chip_layout
             chip = AppKit.NSView.alloc().initWithFrame_(AppKit.NSMakeRect(cx, cy, cw, ch))
             chip.setAlphaValue_(alpha)
@@ -1816,6 +2003,21 @@ class _IslandSurface:
                 chip.addSubview_(_make_translate_icon_view(translate_rect, state))
             self.content.addSubview_(chip)
             self.body_views.append((chip, (cx, cy, cw, ch)))
+        self.live_input_control = _make_live_input_icon_view(
+            _island_live_input_rect((0, 0, target[2], target[3]), anchor),
+            decor.live_input_active, decor.live_input_error)
+        self.content.addSubview_(self.live_input_control)
+        self.content.live_input_views = [self.live_input_control]
+        self.content.header_control_views = [self.live_input_control]
+        self.language_view = None
+        if decor.language is not None:
+            self.language_view = _make_language_view(
+                _island_language_rect((0, 0, target[2], target[3]), anchor),
+                decor.language, decor.language_pending)
+            self.content.addSubview_(self.language_view)
+            self.content.header_control_views.append(self.language_view)
+        for view in self.content.header_control_views:
+            view.setHidden_(not getattr(self.content, "header_controls_visible", False))
         self.right_status = _make_audio_meter_view()
         self.right_status.level = self.audio_level
         self.content.addSubview_(self.right_status)
@@ -1879,6 +2081,11 @@ class _IslandSurface:
         wing_width = (w - self.anchor.camera_width) / 2
         inset = max(8.0, min(36.0, (wing_width - 20) / 2))
         sy = h - self.anchor.header_height / 2 - 10
+        self.live_input_control.setFrame_(AppKit.NSMakeRect(
+            *_island_live_input_rect((0, 0, w, h), self.anchor)))
+        if self.language_view is not None:
+            self.language_view.setFrame_(AppKit.NSMakeRect(
+                *_island_language_rect((0, 0, w, h), self.anchor)))
         self.right_status.setFrame_(AppKit.NSMakeRect(w - inset - 20, sy, 20, 20))
         close, corners = _overlay_controls((0, 0, w, h))
         for view, frame in zip(self.content.control_views, [close, *corners.values()]):
@@ -1911,6 +2118,25 @@ class _AppKitRenderer:
         self.island = None
         self.audio_timer = None
         self.audio_meter = AudioLevelMeter()
+        self._live_input_started_at = None
+
+    def update_live_input_indicator(self, now, active):
+        """Advance only the dots on the existing caption tick; no extra timer/layout."""
+        if not active:
+            self._live_input_started_at = None
+            return
+        if self._live_input_started_at is None:
+            self._live_input_started_at = now
+        count = 1 + int(max(0.0, now - self._live_input_started_at)
+                        / _LIVE_INPUT_DOT_INTERVAL_SEC) % 3
+        changed = False
+        for view in getattr(self.content, "live_input_views", ()):
+            if hasattr(view, "dot_count") and view.dot_count != count:
+                view.dot_count = count
+                view.setNeedsDisplay_(True)
+                changed = True
+        if changed and self.panel.isVisible():
+            self.panel.displayIfNeeded()
 
     def start_audio_meter(self, level_source):
         import AppKit
@@ -1973,6 +2199,16 @@ class _AppKitRenderer:
         return self.island is not None and self.island.animating
 
     @property
+    def live_input_frame(self):
+        if (self.island is None or not self.panel.isVisible()
+                or self.island.live_input_control.isHidden()):
+            return None
+        frame = self.panel.frame()
+        return _island_live_input_rect(
+            (frame.origin.x, frame.origin.y, frame.size.width, frame.size.height),
+            self.island.anchor)
+
+    @property
     def control_frame(self):
         if self.island is not None and (self.island.compact or self.island.animating):
             return None
@@ -1994,10 +2230,21 @@ class _AppKitRenderer:
             self.content.setNeedsDisplay_(True)
             self.panel.displayIfNeeded()
 
+    def set_header_controls_visible(self, visible):
+        self.content.header_controls_visible = visible
+        changed = False
+        for view in getattr(self.content, "header_control_views", ()):
+            if view.isHidden() == visible:
+                view.setHidden_(not visible)
+                changed = True
+        if changed:
+            self.panel.displayIfNeeded()
+
     def hide(self):
         if self.island is not None:
             self.island.stop()
         self.set_controls_visible(False)
+        self.set_header_controls_visible(False)
         self.panel.orderOut_(None)
 
 
@@ -2028,10 +2275,20 @@ def _row_delta_from_scroll_event(event, accumulated_px, sign=_SCROLL_SIGN):
     fling), new_accumulated_px is the leftover sub-row remainder to carry
     into the next event.
 
-    Direction, from Apple's NSEvent.h doc comments PLUS a hands-on
-    correction:
-      - isDirectionInvertedFromDevice's doc comment: scrollingDeltaY's
-        sign ALREADY reflects natural scrolling (moving the CONTENT).
+    Direction, from Apple's NSEvent.h doc comments (Apple's live web docs
+    at developer.apple.com render via JS and returned no text through
+    WebFetch; a GitHub mirror of the macOS SDK headers is the primary
+    source) PLUS a hands-on correction:
+      - isDirectionInvertedFromDevice's doc comment: "the user may choose
+        to change the scrolling behavior such that it feels like they are
+        moving the content instead of the scroll bar. To accomplish this,
+        deltaX/Y and scrollingDeltaX/Y are automatically inverted for
+        NSScrollWheel events according to the user's preference[s]" --
+        i.e. scrollingDeltaY's sign, as read here, ALREADY reflects
+        "natural scrolling" (macOS's default since Lion/10.7): it feels
+        like moving the CONTENT with your fingers.
+      - deltaY's doc comment (legacy swipe API, same underlying
+        convention): "-1 for swipe down and 1 for swipe up".
       - Older caption rows sit ABOVE the pinned live row. Swiping DOWN
         moves the content down and reveals that older history -- the
         Messages/Slack direction. That gesture reports a NEGATIVE
@@ -2172,21 +2429,49 @@ class _OverlayController:
 
     def __init__(self, display_queue, font_size=_DEFAULT_FONT_SIZE, renderer=None,
                  settings_path=DEFAULT_SETTINGS_PATH, debug_input=False, copy_fn=None,
-                 translate_fn=None, run_async=None, position=None, level_source=None):
+                 translate_fn=None, run_async=None, position=None, level_source=None,
+                 translate_backend=None, schedule_main=None, auto_translate=False,
+                 auto_translate_fn=None, live_input_session=None, language=None,
+                 language_change=None, language_source=None):
         self.display_queue = display_queue
         self.font_size = font_size
         self.settings_path = settings_path
         self._debug_input = debug_input  # see _log_debug_input / main()'s --debug-input
         self._copy_fn = copy_fn if copy_fn is not None else _copy_text_to_pasteboard
+        self._live_input = live_input_session if live_input_session is not None else live_input.LiveInputSession()
         # Translate icon (see _start_translate): `translate_fn` is the
         # blocking text->translation call, `run_async` how it gets off the
         # UI thread. Tests inject a fake pair -- a synchronous run_async
         # keeps the queue/tick handoff itself real while removing the
         # concurrency, so nothing here needs a thread or a network.
         self._translate_fn = translate_fn if translate_fn is not None else translator.translate
+        if translate_fn is None and translate_backend is not None:
+            self._translate_fn = partial(translator.translate, backend=translate_backend)
+        # Automatic caption translation in either direction uses local Ollama.
+        # The manual translate icon keeps its independently configured backend.
+        self._async_translation_enabled = bool(auto_translate)
+        self._language = language
+        self._language_change = language_change
+        self._language_source = language_source
+        self._language_pending = None
+        self._language_generation = 0
+        self._auto_translate = bool(auto_translate and (language is None or language in TRANSLATION_MODES))
+        self._auto_translate_fn = auto_translate_fn
+        self._live_translation_pending = {}  # utterance sequence -> source; insertion order is capture order
+        self._live_translation_sequence = 0
+        self._live_translation_last_sent = None
+        self._live_translation_eligible_sequence = None
         self._run_async = run_async if run_async is not None else _run_in_background
         self.model = CaptionLineModel(idle_clear_sec=_IDLE_CLEAR_SEC)
         self.renderer = renderer if renderer is not None else _AppKitRenderer(font_size)
+        self._closed = False
+        panel = getattr(self.renderer, "panel", None)
+        if panel is not None:
+            panel.on_key_down = self._handle_key_down
+        self._schedule_main = schedule_main
+        if self._schedule_main is None and isinstance(self.renderer, _AppKitRenderer):
+            from PyObjCTools import AppHelper
+            self._schedule_main = AppHelper.callAfter
         content = getattr(self.renderer, "content", None)
         if content is not None:
             content.on_scroll = self._handle_scroll_wheel
@@ -2227,7 +2512,8 @@ class _OverlayController:
         # geometry-derived fields must match self.geometry's own initial
         # values for the same reason -- built via the same helper tick()
         # uses so the two can never drift apart.
-        self._last_state = self._geometry_state(((), (), 0, None, None, None, None))
+        self._last_state = self._geometry_state(((), (), 0, None, None, None, None, False, False,
+                                                None, False))
         if self.geometry.top_anchored:
             self._last_state = None  # Draw the compact island before the first recognition.
         self._hovering = False
@@ -2238,11 +2524,13 @@ class _OverlayController:
         self._drag_base = None
         self._resize_base = None
         self._width_resize_base = None
+        self._height_resize_base = None
         self._dismissed = False
         self._pinned = False
         self._close_hovered = False
         self._settings_dirty_at = None
         self._row_boxes = []          # [RowBox, ...] from the most recent repaint -- see tick()
+        self._row_sources = {}       # rendered row index -> original recognition text
         self._hover_row = None        # index into the current `rows`, or None -- see tick()
         self._copied = None           # (text, expire_at monotonic) or None -- see _handle_mouse_down/tick()
         self._icon_hover_started_at = None
@@ -2261,6 +2549,11 @@ class _OverlayController:
         self._translate = None
         self._translate_queue = queue.Queue()
         self._translate_inflight = set()
+        self._auto_pending = deque()  # two waiting normally, up to 32 while dictating
+        self._auto_active_generation = None
+        self._auto_active = None
+        self._manual_waiting = set()
+        self._translated_rows = {}   # original -> displayed translation, retained with history
         self._translate_hover_started_at = None
         self._translate_hover_done_text = None
         self._global_mouse_monitor = None
@@ -2281,8 +2574,17 @@ class _OverlayController:
         g = self.geometry
         screen_state = getattr(self.renderer, "screen_state", None)
         return base + (round(g.font_size, 2), round(g.cx_frac, 4), round(g.bottom_px, 1),
-                       g.position, round(g.island_width, 1),
+                       g.position, round(g.island_width, 1), round(g.island_height, 1),
                        screen_state(g) if screen_state else None)
+
+    def _sync_history_window(self):
+        window = CaptionLineModel.HISTORY_WINDOW
+        if self.geometry.top_anchored:
+            screen_state = getattr(self.renderer, "screen_state", None)
+            anchor = screen_state(self.geometry) if screen_state else None
+            if isinstance(anchor, IslandAnchor):
+                window = _island_history_window(self.geometry, anchor)
+        self.model.set_history_window(window)
 
     def _handle_scroll_wheel(self, event):
         if _is_command_scroll(event):
@@ -2296,6 +2598,7 @@ class _OverlayController:
             return
         delta = _scroll_rows_from_event(event)
         if delta:
+            self._sync_history_window()
             self.model.scroll_by(delta, time.monotonic())
             # tick()'s own timer picks up the resulting state change on its
             # next cycle (<=_POLL_INTERVAL_SEC away, imperceptible) -- not
@@ -2381,6 +2684,9 @@ class _OverlayController:
         if getattr(self.renderer, "animating", False):
             return  # Target hit boxes are valid only after the shell settles.
         mouse = self._click_point(event)
+        if self.geometry.top_anchored and self._hits_live_input(mouse):
+            self._toggle_live_input()
+            return
         if (self.geometry.top_anchored
                 and not self._row_boxes):
             self.show_from_menu()
@@ -2402,10 +2708,17 @@ class _OverlayController:
                 if isinstance(anchor, IslandAnchor):
                     edge = _island_resize_edge(mouse, control_frame, anchor.header_height)
                     if edge is not None:
-                        self._width_resize_base = (
-                            mouse[0], _island_display_width(anchor, self.geometry), edge, anchor)
+                        self._width_resize_base = (mouse[0], _island_display_width(anchor, self.geometry),
+                                                   edge, anchor)
                         self._dragging = True
                         return
+                    if _island_resize_bottom(mouse, control_frame):
+                        self._height_resize_base = (mouse[1], control_frame[3], anchor)
+                        self._dragging = True
+                        return
+        if not self.geometry.top_anchored and self._hits_live_input(mouse):
+            self._toggle_live_input()
+            return
         box = _hit_icon(mouse, self._row_boxes)
         translate_box = _hit_translate_icon(mouse, self._row_boxes) if box is None else None
         if self._debug_input:
@@ -2445,6 +2758,82 @@ class _OverlayController:
             print(f"[caption-overlay] {prefix}copy FAILED for: {box.text}")
         return False
 
+    def _translation_needed(self, text):
+        if self._language == "ja-en":
+            return translator.detect_direction(text) == translator.JA_TO_EN
+        return translator.needs_japanese_translation(text)
+
+    def _discard_live_translation(self, text):
+        self._live_translation_pending = {
+            seq: source for seq, source in self._live_translation_pending.items() if source != text}
+
+    def _flush_live_translations(self):
+        """Insert completed translations in speech order, never the source preview."""
+        if not self._live_input.active:
+            self._live_translation_pending.clear()
+            return
+        while self._live_translation_pending:
+            seq, source = next(iter(self._live_translation_pending.items()))
+            result = self._translated_rows.get(source)
+            if result is None:
+                if self._translation_needed(source):
+                    break
+                result = source  # already in the output language, or a product name
+            del self._live_translation_pending[seq]
+            if seq == self._live_translation_last_sent:
+                self._live_input.feed(("replace", result), current_text=result)
+            elif self._live_translation_last_sent is None or seq > self._live_translation_last_sent:
+                self._live_input.feed(("chunk", result), fresh=True, current_text=result)
+                self._live_translation_last_sent = seq
+            self._live_input.flush()
+
+    def _queue_auto_translate(self, text):
+        """Show source speech now; translate recent rows off the UI thread."""
+        if (not self._auto_translate or self._closed or not text or
+                not self._translation_needed(text) or
+                text in self._translated_rows or
+                (text in self._translate_inflight and not
+                 (text == self._auto_active and self._auto_active_generation != self._language_generation)) or
+                text in self._auto_pending):
+            return
+        if len(self._auto_pending) >= (32 if self._live_input.active else 2):
+            # Keep rows the user explicitly asked to translate. Otherwise
+            # discard the oldest queued row so a slow Ollama cannot build a
+            # stale translation backlog during a fast conversation.
+            discard = next((old for old in self._auto_pending
+                            if old not in self._manual_waiting), None)
+            if discard is None:
+                return
+            self._auto_pending.remove(discard)
+            self._discard_live_translation(discard)
+        self._auto_pending.append(text)
+        self._start_next_auto_translate()
+
+    def _start_next_auto_translate(self):
+        if self._closed or self._auto_active is not None or not self._auto_pending:
+            return
+        text = self._auto_pending.popleft()
+        self._auto_active = text
+        self._translate_inflight.add(text)
+        generation = self._language_generation
+        self._auto_active_generation = generation
+        translate = self._auto_translate_fn or partial(
+            translator.translate, backend="local",
+            direction=translator.JA_TO_EN if self._language == "ja-en" else translator.EN_TO_JA)
+
+        def worker():
+            try:
+                self._translate_queue.put((text, translate(text), None, "auto", generation))
+            except Exception as exc:  # a failed translation keeps the source caption
+                self._translate_queue.put((text, None, exc, "auto", generation))
+            if self._schedule_main is not None:
+                try:
+                    self._schedule_main(self._translation_ready)
+                except Exception:
+                    pass
+
+        self._run_async(worker)
+
     def _start_translate(self, box, source):
         """Kick off one row's translation on a background worker and put its
         icon into the "pending" state. Returns False (changing nothing) when
@@ -2453,17 +2842,26 @@ class _OverlayController:
         twice or race two results into the clipboard.
 
         The worker ONLY calls _translate_fn and puts (text, result, error)
-        on _translate_queue; everything with a side effect the user can see
+        on _translate_queue, then wakes the main thread; everything with a side effect the user can see
         -- writing the clipboard, moving the icon out of "pending" -- happens
         back on the UI thread in _drain_translations. Exceptions are captured
         rather than raised: this can be reached from an AppKit mouseDown_
         callback, which must never see one propagate (same contract
         _copy_text_to_pasteboard already keeps)."""
-        text = box.text
-        if text in self._translate_inflight:
+        text = self._row_sources.get(box.index, box.text)
+        if text in self._translate_inflight or text in self._auto_pending:
+            self._manual_waiting.add(text)
+            self._translate = (text, "pending", None)
             if self._debug_input:
                 print(f"[caption-overlay] {source}: translation already in flight for: {text}")
-            return False
+            return True
+
+        if text in self._translated_rows:
+            # A second click can copy the completed translation immediately,
+            # including retrying a failed clipboard write without another request.
+            self._translate_queue.put((text, self._translated_rows[text], None, "manual"))
+            self._drain_translations(time.monotonic())
+            return True
 
         self._translate_inflight.add(text)
         self._translate = (text, "pending", None)
@@ -2472,41 +2870,86 @@ class _OverlayController:
 
         def worker():
             try:
-                self._translate_queue.put((text, self._translate_fn(text), None))
+                self._translate_queue.put((text, self._translate_fn(text), None, "manual"))
             except Exception as exc:      # noqa: BLE001 -- reported via the queue, see above
-                self._translate_queue.put((text, None, exc))
+                self._translate_queue.put((text, None, exc, "manual"))
+            if self._schedule_main is not None:
+                try:
+                    self._schedule_main(self._translation_ready)
+                except Exception:
+                    pass  # The normal tick still drains the queue if scheduling fails.
 
         self._run_async(worker)
         return True
+
+    def _translation_ready(self):
+        """Deliver the clipboard result on the main thread, without rendering.
+
+        The next regular tick updates caption text and lays out the island.
+        A background request that outlives the panel must not touch the clipboard.
+        """
+        if not self._closed:
+            self._drain_translations(time.monotonic())
 
     def _drain_translations(self, now):
         """Apply every finished translation waiting on _translate_queue: put
         the TRANSLATION (not the original) on the clipboard and start the
         icon's ~COPY_FEEDBACK_SEC checkmark, or fall to the "failed" icon.
+        Also retain the result for the island's displayed caption text.
 
         Failures print one warning line unconditionally -- NOT only under
         --debug-input, unlike most logging here: a translate click that
         silently does nothing (bad/absent API key, no credit, no network) is
         otherwise unexplainable from the panel alone, and this line is the
         only place the reason exists."""
+        if self._closed:
+            return
         while True:
             try:
-                text, result, error = self._translate_queue.get_nowait()
+                item = self._translate_queue.get_nowait()
+                text, result, error, mode = item[:4]
+                generation = item[4] if len(item) > 4 else self._language_generation
             except queue.Empty:
                 break
             except Exception:
                 break   # a poisoned queue must never crash the UI loop
             self._translate_inflight.discard(text)
+            manual = mode == "manual" or text in self._manual_waiting
+            self._manual_waiting.discard(text)
+            if mode == "auto":
+                self._auto_active = None
+                if generation != self._language_generation and not manual:
+                    self._start_next_auto_translate()
+                    continue
             if error is not None:
+                self._discard_live_translation(text)
                 print(f"[caption-overlay] warning: translation failed: {error}")
-                self._translate = (text, "failed", now + COPY_FEEDBACK_SEC)
-            elif self._copy_fn(result):
-                self._translate = (text, "done", now + COPY_FEEDBACK_SEC)
-                if self._debug_input:
-                    print(f"[caption-overlay] translated -> clipboard: {result}")
+                if manual:
+                    self._translate = (text, "failed", now + COPY_FEEDBACK_SEC)
             else:
-                print("[caption-overlay] warning: the translation could not be copied to the clipboard")
-                self._translate = (text, "failed", now + COPY_FEEDBACK_SEC)
+                if manual:
+                    if self._copy_fn(result):
+                        self._translate = (text, "done", now + COPY_FEEDBACK_SEC)
+                        if self._debug_input:
+                            print(f"[caption-overlay] translated -> clipboard: {result}")
+                    else:
+                        print("[caption-overlay] warning: the translation could not be copied to the clipboard")
+                        self._translate = (text, "failed", now + COPY_FEEDBACK_SEC)
+                # A source echo must never be typed as a successful translation.
+                expected = translator.EN_TO_JA if self._language == "ja-en" else translator.JA_TO_EN
+                usable = bool(result and (mode != "auto" or translator.detect_direction(result) == expected))
+                if usable and (mode != "auto" or generation == self._language_generation):
+                    # Model text remains original. The island render uses
+                    # this override for either the live or a historical row.
+                    self._translated_rows[text] = result
+                    if mode == "auto" and self.model._text == text:
+                        self.model._last_event_at = now
+                elif mode == "auto":
+                    self._discard_live_translation(text)
+                    print("[caption-overlay] warning: local translation returned no text in the output language")
+            if mode == "auto":
+                self._start_next_auto_translate()
+            self._flush_live_translations()
 
     def _install_global_mouse_monitor(self):
         """Copy through a click that macOS routes below this utility panel.
@@ -2542,9 +2985,83 @@ class _OverlayController:
         translate_box = _hit_translate_icon((point.x, point.y), self._row_boxes)
         if translate_box is not None:
             self._start_translate(translate_box, "global mouseDown")
+            return
+        if self._hits_live_input((point.x, point.y)):
+            self._toggle_live_input()
+
+    def _hits_live_input(self, point):
+        if not self._panel_visible:
+            return False
+        if self.geometry.top_anchored:
+            rect = getattr(self.renderer, "live_input_frame", None)
+            return rect is not None and _point_in_rect(point, rect)
+        return _hit_live_input_icon(point, self._row_boxes) is not None
+
+    def _toggle_live_input(self):
+        active = self._live_input.toggle()
+        self._live_translation_pending.clear()
+        self._live_translation_last_sent = None
+        self._live_translation_eligible_sequence = None
+        panel = getattr(self.renderer, "panel", None)
+        if active and panel is not None:
+            # The non-activating panel can take keyboard focus on hover.
+            # Return it to the user's input field as soon as dictation starts.
+            panel.resignKeyWindow()
+        if self._live_input.error:
+            print(f"[caption-overlay] {self._live_input.error}", file=sys.stderr)
+        elif self._debug_input:
+            print(f"[caption-overlay] Live Input {'on' if active else 'off'}")
+        self._last_state = None
+
+    def _handle_key_down(self, event):
+        """Local island shortcuts only; never monitor keys in another input field."""
+        panel = getattr(self.renderer, "panel", None)
+        if (self._closed or not self.geometry.top_anchored or not self._panel_visible
+                or panel is None or not panel.isKeyWindow()):
+            return False
+        # Shift/Caps Lock are allowed; Cmd/Option/Ctrl combinations retain their meaning.
+        if event.modifierFlags() & ((1 << 20) | (1 << 19) | (1 << 18)):
+            return False
+        key = (event.charactersIgnoringModifiers() or "").lower()
+        if key not in ("l", "i") or (key == "i" and self._language_change is None):
+            return False
+        if event.isARepeat():
+            return True
+        if key == "l":
+            self._toggle_live_input()
+        elif self._language_pending is None:
+            target = next_language_mode(self._language)
+            try:
+                if self._language_change(target):
+                    self._language_pending = target
+                    self._last_state = None
+            except Exception as exc:
+                print(f"[caption-overlay] 言語を切り替えられません: {exc}", file=sys.stderr)
+        return True
+
+    def _apply_language(self, language):
+        if language not in LANGUAGE_MODES:
+            return
+        if self._language_pending == language:
+            self._language_pending = None
+            self._last_state = None
+        if self._language == language:
+            return
+        self._language = language
+        self._language_generation += 1
+        self._auto_translate = self._async_translation_enabled and language in TRANSLATION_MODES
+        self._live_translation_pending.clear()
+        self._live_translation_last_sent = None
+        self._live_translation_eligible_sequence = None
+        self._translated_rows.clear()
+        self._auto_pending = deque(text for text in self._auto_pending if text in self._manual_waiting)
+        self._last_state = None
 
     def show_from_menu(self):
         """Restore the last caption and keep it shown until explicitly closed."""
+        panel = getattr(self.renderer, "panel", None)
+        if self.geometry.top_anchored and panel is not None:
+            panel.makeKeyAndOrderFront_(None)
         self._pinned = True
         self._dismissed = False
         self._last_state = None
@@ -2559,10 +3076,17 @@ class _OverlayController:
         self._hover_row = None
         self._row_boxes = []
         if self.geometry.top_anchored:
-            self.renderer.show([], (), self.geometry.font_size, self.geometry)
+            self.renderer.show([], (), self.geometry.font_size, self.geometry,
+                               decor=RowDecor(live_input_active=self._live_input.active,
+                                              live_input_error=bool(self._live_input.error),
+                                              language=self._language if self._language_change else None,
+                                              language_pending=self._language_pending is not None))
             self._panel_visible = True
         else:
             self.renderer.hide()
+        set_header_visible = getattr(self.renderer, "set_header_controls_visible", None)
+        if set_header_visible is not None:
+            set_header_visible(False)
 
     def _resize_to(self, mouse):
         origin, (sx, sy), font_size, frame = self._resize_base
@@ -2574,6 +3098,15 @@ class _OverlayController:
         self._settings_dirty_at = time.monotonic()
 
     def _handle_mouse_drag(self, event):
+        if self._height_resize_base is not None:
+            start_y, start_height, anchor = self._height_resize_base
+            dy = self._click_point(event)[1] - start_y
+            minimum = anchor.header_height + self.geometry.font_size + 2 * anchor.caption_padding
+            maximum = max(minimum, anchor.top - 40.0)
+            self.geometry.island_height = max(minimum, min(maximum, start_height - dy))
+            self._settings_dirty_at = time.monotonic()
+            self.tick()
+            return
         if self._width_resize_base is not None:
             start_x, start_width, edge, anchor = self._width_resize_base
             dx = self._click_point(event)[0] - start_x
@@ -2624,7 +3157,8 @@ class _OverlayController:
         if panel is not None:
             frame = panel.frame()
             x, y = _drag_reposition_origin(visible, frame.size.width, frame.size.height,
-                                            self.geometry.font_size, self.geometry)
+                                            self.geometry.font_size, self.geometry,
+                                            left_action=True)
             panel.setFrameOrigin_(AppKit.NSMakePoint(x, y))
 
         self._settings_dirty_at = time.monotonic()
@@ -2641,6 +3175,7 @@ class _OverlayController:
         self._drag_base = None
         self._resize_base = None
         self._width_resize_base = None
+        self._height_resize_base = None
         if was_dragging and self.settings_path is not None:
             save_geometry(self.settings_path, self.geometry)
             self._settings_dirty_at = None
@@ -2667,7 +3202,7 @@ class _OverlayController:
             if hovering and self.geometry.top_anchored:
                 self._dismissed = False
             panel.setIgnoresMouseEvents_(False)
-            if hovering:
+            if hovering and not self._live_input.active:
                 # Being merely eligible to become key is insufficient:
                 # this process normally runs as an accessory app, so macOS
                 # otherwise continues routing the next physical click to
@@ -2729,6 +3264,9 @@ class _OverlayController:
         caller owns the timer."""
         if now is None:
             now = time.monotonic()
+        self._sync_history_window()
+        # Prioritize completed translations over display events, hover/layout work.
+        self._drain_translations(now)
         q = self.display_queue
         if q is not None:
             while True:
@@ -2738,9 +3276,39 @@ class _OverlayController:
                     break
                 except Exception:
                     break  # a closed/poisoned queue must never crash the UI loop
+                if event[0] == "language":
+                    self._apply_language(event[1])
+                    continue
+                before_text = self.model._text
+                before_ended = self.model._ended
+                before_id = self.model._utterance_id
+                before_visible = self.model._live_visible_at(now)
                 self.model.apply(event, now)
+                fresh = (event[0] == "chunk" and
+                         (before_ended or not before_visible or
+                          (event[2] if len(event) > 2 else None) != before_id))
+                accepted = event[0] != "replace" or self.model._text != before_text
+                translating = self._language in TRANSLATION_MODES
+                if fresh:
+                    self._live_translation_sequence += 1
+                    self._live_translation_eligible_sequence = (
+                        self._live_translation_sequence if self._live_input.active else None)
+                if translating and self._auto_translate:
+                    if (accepted and event[0] in ("eos", "replace") and self._live_input.active
+                            and self._live_translation_eligible_sequence == self._live_translation_sequence):
+                        self._live_translation_pending[self._live_translation_sequence] = self.model._text
+                elif not translating or not self._translation_needed(self.model._text):
+                    self._live_input.feed(event, fresh=fresh, current_text=self.model._text, accepted=accepted)
                 if event[0] == "chunk" and event[1].strip():
                     self._dismissed = False
+                if event[0] in ("eos", "replace"):
+                    self._queue_auto_translate(self.model._text)
+        self._live_input.flush()
+        self._flush_live_translations()
+        if self._language_pending is not None and self._language_source is not None:
+            language = self._language_source()
+            if language == self._language_pending:
+                self._apply_language(language)
 
         # Read the current pointer before deciding whether to hide: entering
         # just as the idle timeout expires must still keep the panel visible.
@@ -2763,7 +3331,8 @@ class _OverlayController:
 
         if not over_controls and not self._dragging:
             self._expanded = self._hovering
-        expanded = self._expanded
+        expanded = self._expanded or (self.geometry.top_anchored
+                                      and self.geometry.island_height > 0)
         hold = self._pinned or self._hovering or self._dragging
         idle = not self.model._live_visible_at(now) and not hold
         if self._dismissed or idle:
@@ -2802,8 +3371,11 @@ class _OverlayController:
         # level non-activating panel can observe the pointer but never gets
         # the physical click.  Pointer polling is reliable there, so resting
         # on the visible copy icon for half a second still performs the
-        # requested copy.  A normal click remains immediate above.
+        # requested copy. Docked islands require an explicit click for both
+        # actions; hovering only reveals their icons and caption history.
+        # A normal click remains immediate above.
         dwell_point = (self._mouse_location() if self._hovering
+                       and not self.geometry.top_anchored
                        and not getattr(self.renderer, "animating", False) else None)
         icon_hit = _hit_icon(dwell_point, self._row_boxes) if dwell_point is not None else None
         if icon_hit is None:
@@ -2851,10 +3423,27 @@ class _OverlayController:
         translate_text = self._translate[0] if self._translate is not None else None
         translate_state = self._translate[1] if self._translate is not None else None
 
+        # Keep recognition text intact: later chunks must append to the original,
+        # and a delayed translation must not replace a newer utterance. Retain
+        # display overrides only while their source remains in caption history.
+        retained = set(self.model._history) | {self.model._text}
+        self._translated_rows = {text: result for text, result in self._translated_rows.items()
+                                 if text in retained}
+        row_sources = {i: text for i, (text, _live) in enumerate(rows)}
+        if self.geometry.top_anchored:
+            rows = [(self._translated_rows.get(text, text), live) for text, live in rows]
+            translate_text = self._translated_rows.get(translate_text, translate_text)
+
         decor = RowDecor(hover_row=self._hover_row, copied_text=copied_text,
-                          translate_text=translate_text, translate_state=translate_state)
+                         translate_text=translate_text, translate_state=translate_state,
+                         live_input_active=self._live_input.active,
+                         live_input_error=bool(self._live_input.error),
+                         language=self._language if self._language_change else None,
+                         language_pending=self._language_pending is not None)
         state = self._geometry_state((tuple(rows), alphas, offset, self._hover_row, copied_text,
-                                       translate_text, translate_state))
+                                       translate_text, translate_state,
+                                       self._live_input.active, bool(self._live_input.error),
+                                       decor.language, decor.language_pending))
         if state != self._last_state:
             self._last_state = state
             self._panel_visible = bool(rows) or self.geometry.top_anchored
@@ -2862,6 +3451,7 @@ class _OverlayController:
                 boxes = self.renderer.show(rows, alphas, self.geometry.font_size, self.geometry,
                                    decor=decor, scroll_frac=offset - math.floor(offset))
                 self._row_boxes = list(boxes) if boxes else []
+                self._row_sources = row_sources
                 if self._debug_input and decor.hover_row is not None:
                     self._log_repaint_debug(rows, decor)
             else:
@@ -2871,9 +3461,16 @@ class _OverlayController:
         if self._panel_visible and not hover_updated:
             self._update_hover()
 
+        update_indicator = getattr(self.renderer, "update_live_input_indicator", None)
+        if update_indicator is not None:
+            update_indicator(now, self._live_input.active)
+
         set_controls_visible = getattr(self.renderer, "set_controls_visible", None)
         if set_controls_visible is not None:
             set_controls_visible(self._panel_visible and (self._hovering or self._dragging))
+        set_header_visible = getattr(self.renderer, "set_header_controls_visible", None)
+        if set_header_visible is not None:
+            set_header_visible(self._panel_visible and self._hovering)
 
         # Debounced settings save: 1s of no further drag/scale change (and
         # not mid-drag -- _handle_mouse_up already saves immediately when a
@@ -2895,6 +3492,12 @@ class _OverlayController:
         once the run loop stops. Called from both run_console_overlay's
         `finally` and live_avatar.cmd_menubar's `finally`, i.e. on every
         normal and Ctrl-C teardown path."""
+        self._closed = True
+        panel = getattr(self.renderer, "panel", None)
+        if panel is not None:
+            panel.on_key_down = None
+        if self._live_input.active:
+            self._live_input.toggle()
         if self.settings_path is not None and self._settings_dirty_at is not None:
             save_geometry(self.settings_path, self.geometry)
             self._settings_dirty_at = None
@@ -2948,28 +3551,15 @@ def _require_appkit():
 
 
 def _resolve_debug_input(debug_input):
-    """Whether --debug-input-style logging should be on: the explicit
-    `debug_input` argument, OR -- when it was NOT explicitly requested --
-    the CAPTION_OVERLAY_DEBUG_INPUT=1 environment variable. Lets a user
-    turn on the same diagnostic logging main()'s --demo --debug-input flag
-    already prints (see _log_debug_input / _OverlayController.
-    _handle_mouse_down / _log_repaint_debug) in a REAL --transcribe-only/
-    --menubar session -- neither of which has a --debug-input CLI flag of
-    its own (see live_avatar.py's --captions wiring) -- with no code
-    change, e.g.:
-        CAPTION_OVERLAY_DEBUG_INPUT=1 .venv/bin/python scripts/avatar/live_avatar.py \\
-            --transcribe-only --captions
-    Only the literal string "1" counts (not "true"/"yes"/etc -- keeps the
-    check trivially simple and unambiguous in a shell one-liner). Pure (no
-    AppKit) -- directly unit-testable; see attach_timer_based_overlay, the
-    only caller (run_console_overlay delegates to it, so this covers both
-    public entry points)."""
+    """Enable diagnostics with CAPTION_OVERLAY_DEBUG_INPUT=1 alwayswhisper live."""
     return debug_input or os.environ.get("CAPTION_OVERLAY_DEBUG_INPUT") == "1"
 
 
 def attach_timer_based_overlay(display_queue, font_size=_DEFAULT_FONT_SIZE,
                                 settings_path=DEFAULT_SETTINGS_PATH, debug_input=False, position=None,
-                                level_source=None):
+                                level_source=None, translate_backend=None,
+                                auto_translate=False, language=None,
+                                language_change=None, language_source=None):
     """Build the panel + model on the CURRENT thread (must be the main
     thread -- AppKit UI objects are not thread-safe to create elsewhere) and
     return a controller with .tick(now=None). Does not start any timer of
@@ -2990,7 +3580,10 @@ def attach_timer_based_overlay(display_queue, font_size=_DEFAULT_FONT_SIZE,
     if position is None and (settings_path is None or not os.path.exists(settings_path)):
         position = "dynamic-island"
     return _OverlayController(display_queue, font_size=font_size, settings_path=settings_path,
-                               debug_input=debug_input, position=position, level_source=level_source)
+                               debug_input=debug_input, position=position, level_source=level_source,
+                               translate_backend=translate_backend,
+                               auto_translate=auto_translate, language=language,
+                               language_change=language_change, language_source=language_source)
 
 
 def _dispatch_pending_events(appkit):
@@ -3026,7 +3619,9 @@ def _run_interactive_event_loop(app_helper):
 
 
 def run_console_overlay(display_queue, font_size=_DEFAULT_FONT_SIZE, settings_path=DEFAULT_SETTINGS_PATH,
-                        position=None, level_source=None):
+                        position=None, level_source=None, translate_backend=None,
+                        auto_translate=False, language=None, language_change=None,
+                        language_source=None):
     """For a caller with no event loop of its own (live_avatar.cmd_transcribe
     / --transcribe-only): build the panel, drive it from a private NSTimer,
     and block the calling (main) thread in AppKit's console run loop until
@@ -3066,7 +3661,9 @@ def run_console_overlay(display_queue, font_size=_DEFAULT_FONT_SIZE, settings_pa
 
     controller = attach_timer_based_overlay(display_queue, font_size=font_size,
                                             settings_path=settings_path, position=position,
-                                            level_source=level_source)
+                                            level_source=level_source, translate_backend=translate_backend,
+                                            auto_translate=auto_translate, language=language,
+                                            language_change=language_change, language_source=language_source)
     timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
         _POLL_INTERVAL_SEC, True, lambda _t: controller.tick()
     )
@@ -3178,13 +3775,13 @@ def _run_demo(font_size, hold_sec=0.0, debug_input=False, position=None):
     # on it being the only evidence.
     real_show, real_hide = controller.renderer.show, controller.renderer.hide
 
-    def _show_and_log(rows, alphas, font_size, geometry, decor=None, scroll_frac=0.0):
+    def _show_and_log(rows, alphas, font_size, geometry, decor=None):
         live_text = rows[-1][0] if rows else ""
         preview = live_text if len(live_text) <= 60 else live_text[:57] + "..."
         print(f"[caption-overlay] --demo: SHOW {len(rows)} row(s), live={preview!r}, "
               f"alphas={tuple(round(a, 2) for a in alphas)}, font_size={font_size:.1f}, "
               f"cx_frac={geometry.cx_frac:.3f}, bottom_px={geometry.bottom_px:.1f}")
-        return real_show(rows, alphas, font_size, geometry, decor=decor, scroll_frac=scroll_frac)
+        return real_show(rows, alphas, font_size, geometry, decor=decor)
 
     def _hide_and_log():
         # Fires both from tick()'s idle-timeout branch (mid-script -- see

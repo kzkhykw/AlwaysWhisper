@@ -1076,7 +1076,8 @@ alwayswhisper live
 
 The first run downloads the MLX Whisper model (about 3 GB). Allow microphone
 access for the terminal/app when macOS prompts. Microphone transcription runs
-locally; the optional translation action described below uses an external API.
+locally; automatic translated captions use local Ollama, while the optional manual
+translation action can use OpenRouter.
 File transcription and video burn-in commands keep their existing behavior.
 
 Live captions are enabled by default. The default **Dynamic Island** is a
@@ -1140,6 +1141,51 @@ run. This biases speech recognition; it is not a chat instruction.
 `alwayswhisper-live` is an equivalent standalone
 entry point. Live microphone ASR requires Apple Silicon; file-based commands
 remain cross-platform.
+
+### Live Input and language modes
+
+Click the island to make it active, then press **I** to cycle through four modes.
+The language badge and Live Input pencil appear only while hovering over the island.
+
+| Badge | Speech → captions / Live Input | Starting flag |
+| --- | --- | --- |
+| `JA` | Japanese → Japanese | `--language ja` (default) |
+| `EN` | English → English | `--language en` |
+| `EN→JA` | English → Japanese | `--language en-ja` |
+| `JA→EN` | Japanese → English | `--language ja-en` |
+
+Switching completes the current audio segment, then changes modes without restarting
+capture, the process, or the loaded model. Pending changes show `…`. The transcript
+files continue in the same folder and preserve recognized source text; JSONL segments
+record the mode after a change. `--language auto` remains available for automatic
+recognition outside this four-mode cycle.
+
+Click the pencil, or press **L** while the island is active, to toggle Live Input.
+It types new text at the caret in the currently focused editable field, without line
+breaks. Turning it on returns focus to your input field. To turn it off by keyboard,
+click the island again and press L. Password fields are excluded; first use requires
+macOS Accessibility/input permission for your terminal or Python app. It stays on
+through idle time and island dismissal, until explicitly toggled off or the app exits.
+While hovered and on, the pencil becomes a repeating `. → .. → ...` indicator.
+
+In translation modes, **Live Input waits for the translated text** instead of typing
+the original-language preview. Failed or cancelled translations are not inserted.
+Automatic translation uses local Ollama, with no API key or cloud translation request.
+Install/run Ollama, then prepare the default model:
+
+```bash
+ollama pull qwen3.5:9b
+alwayswhisper live --language ja-en
+```
+
+`OLLAMA_TRANSLATE_MODEL` selects another installed model, `OLLAMA_API_URL` overrides
+`http://127.0.0.1:11434/api/chat`, and `OLLAMA_TRANSLATE_KEEP_ALIVE` sets model residency
+(default `15m`). Source captions appear immediately and are replaced when the local
+translation completes. `--no-async-caption-translation` waits before showing captions;
+terminal-only translation also uses local Ollama. Normal JA/EN modes need no translator.
+The manual translation icon can use Ollama with `--translate-backend local`; its
+OpenRouter option is described below. Drag the bottom of the expanded island to show
+more history; height, width, and text size are remembered.
 
 ### Optional translation: OpenRouter API
 

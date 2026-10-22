@@ -1,4 +1,4 @@
-"""Unit tests for alwayswhisper.live.translator.py -- the JA<->EN translation
+"""Unit tests for alwayswhisper.live.translator -- the JA<->EN translation
 helper behind caption_overlay.py's translate icon.
 
 Headless and offline by construction: every test that exercises translate()
@@ -31,6 +31,8 @@ def _no_real_dotenv(monkeypatch, tmp_path):
     silently stop testing anything. Every test in this file therefore runs
     against a .env path that does not exist unless it makes one itself."""
     monkeypatch.setattr(tr, "DEFAULT_ENV_FILE", str(tmp_path / "does-not-exist.env"))
+    for key in (tr.BACKEND_ENV, tr.LOCAL_MODEL_ENV, tr.LOCAL_API_URL_ENV):
+        monkeypatch.delenv(key, raising=False)
 
 
 # ------------------------------------------------------------ detect_direction ---
@@ -82,12 +84,33 @@ def test_build_payload_system_prompt_names_the_target_language_per_direction():
     en_to_ja = tr.build_payload("hello", tr.EN_TO_JA, "m")["messages"][0]["content"]
 
     assert "Japanese text into natural, spoken English" in ja_to_en
-    assert "English text into natural, spoken Japanese" in en_to_ja
+    assert "Japanese/English text into natural, spoken Japanese" in en_to_ja
 
 
 def test_build_payload_rejects_an_unknown_direction():
     with pytest.raises(ValueError):
         tr.build_payload("hi", "fr->de", "m")
+
+
+@pytest.mark.parametrize("backend", ["openrouter", "local"])
+def test_explicit_japanese_direction_for_mixed_speech(backend):
+    calls = []
+
+    def post(url, headers, payload, timeout):
+        calls.append(payload)
+        if backend == "local":
+            return {"message": {"content": "では始めましょう"}, "done": True}
+        return _ok_response("では始めましょう")
+
+    assert tr.translate("では let's get started", direction=tr.EN_TO_JA,
+                        backend=backend, api_key="fake", post_json=post) == "では始めましょう"
+    assert "spoken Japanese" in calls[0]["messages"][0]["content"]
+    assert calls[0]["messages"][1]["content"] == "では let's get started"
+
+
+def test_invalid_explicit_direction_fails_before_transport():
+    with pytest.raises(tr.TranslationError, match="unknown translation direction"):
+        tr.translate("hello", direction="bad", post_json=lambda *args: pytest.fail("network"))
 
 
 # -------------------------------------------------------------------- translate ---
@@ -305,5 +328,107 @@ def test_translate_finds_an_api_key_that_only_exists_in_the_env_file(monkeypatch
     assert post.calls[0]["headers"]["Authorization"] == "Bearer sk-from-dotenv"
 
 
-def test_default_env_file_points_at_launch_directory_dotenv():
+def test_default_env_file_points_at_the_launch_directory():
     assert _REAL_DEFAULT_ENV_FILE == os.path.abspath(".env")
+
+
+def _local_response(content="Hello."):
+    return {"message": {"role": "assistant", "content": content}, "done": True, "done_reason": "stop"}
+
+
+def test_local_translation_uses_reviewed_prompts_without_openrouter_settings(monkeypatch):
+    def local_only_env(name):
+        assert not name.startswith("OPENROUTER_")
+        return ""
+    monkeypatch.setattr(tr, "_env_value", local_only_env)
+    post = _RecordingPost(_local_response(' "Hello." '))
+    assert tr.translate("こんにちは", backend="local", api_key="must-not-be-sent", post_json=post) == "Hello."
+    call = post.calls[0]
+    assert call["url"] == "http://127.0.0.1:11434/api/chat"
+    assert "Authorization" not in call["headers"]
+    payload = call["payload"]
+    assert payload["model"] == "qwen3.5:9b"
+    assert payload["messages"] == tr.build_payload("こんにちは", tr.JA_TO_EN, "m")["messages"]
+    assert payload["think"] is False
+    assert payload["stream"] is False
+    assert payload["options"]["num_ctx"] == 8192
+    assert payload["options"]["temperature"] == 0.2
+    assert "max_tokens" not in payload
+
+
+def test_local_settings_can_be_changed_in_dotenv_between_requests(monkeypatch, tmp_path):
+    path = tmp_path / ".env"
+    path.write_text("TRANSLATE_BACKEND=local\nOLLAMA_TRANSLATE_MODEL=local-test\n", encoding="utf-8")
+    monkeypatch.setattr(tr, "DEFAULT_ENV_FILE", str(path))
+    post = _RecordingPost(_local_response())
+    tr.translate("こんにちは", post_json=post)
+    assert post.calls[-1]["payload"]["model"] == "local-test"
+
+    path.write_text("TRANSLATE_BACKEND=openrouter\nOPENROUTER_API_KEY=test-key\n", encoding="utf-8")
+    post.response = _ok_response("Hello.")
+    tr.translate("こんにちは", post_json=post)
+    assert post.calls[-1]["url"] == tr.DEFAULT_API_URL
+
+
+def test_backend_environment_and_explicit_overrides_win_over_dotenv(monkeypatch, tmp_path):
+    path = tmp_path / ".env"
+    path.write_text("TRANSLATE_BACKEND=openrouter\n", encoding="utf-8")
+    monkeypatch.setattr(tr, "DEFAULT_ENV_FILE", str(path))
+    monkeypatch.setenv(tr.BACKEND_ENV, "local")
+    post = _RecordingPost(_local_response())
+    tr.translate("こんにちは", post_json=post)
+    assert post.calls[-1]["url"] == tr.DEFAULT_LOCAL_API_URL
+    post.response = _ok_response("Hello.")
+    tr.translate("こんにちは", backend="openrouter", api_key="test", post_json=post)
+    assert post.calls[-1]["url"] == tr.DEFAULT_API_URL
+
+
+def test_local_model_and_endpoint_are_independent_and_overridable(monkeypatch):
+    monkeypatch.setenv(tr.MODEL_ENV, "cloud/model")
+    monkeypatch.setenv(tr.API_URL_ENV, "https://cloud.invalid/chat")
+    monkeypatch.setenv(tr.LOCAL_MODEL_ENV, "local/model")
+    monkeypatch.setenv(tr.LOCAL_API_URL_ENV, "http://localhost:12345/api/chat")
+    post = _RecordingPost(_local_response())
+    tr.translate("Hello", backend="local", post_json=post)
+    assert post.calls[-1]["payload"]["model"] == "local/model"
+    assert post.calls[-1]["url"] == "http://localhost:12345/api/chat"
+    assert post.calls[-1]["payload"]["messages"] == tr.build_payload("Hello", tr.EN_TO_JA, "m")["messages"]
+    tr.translate("Hello", backend="local", model="explicit", url="http://localhost:2/api/chat", post_json=post)
+    assert post.calls[-1]["payload"]["model"] == "explicit"
+    assert post.calls[-1]["url"] == "http://localhost:2/api/chat"
+
+
+def test_local_failure_never_falls_back_to_cloud_and_releases_the_lock(monkeypatch):
+    monkeypatch.setenv(tr.API_KEY_ENV, "cloud-key-present")
+    post = _RecordingPost(raises=ConnectionRefusedError("connection refused"))
+    with pytest.raises(tr.TranslationError, match="Start Ollama"):
+        tr.translate("こんにちは", backend="local", post_json=post)
+    assert len(post.calls) == 1
+    assert post.calls[0]["url"] == tr.DEFAULT_LOCAL_API_URL
+    assert tr.translate("こんにちは", backend="local", post_json=_RecordingPost(_local_response())) == "Hello."
+
+
+@pytest.mark.parametrize("response", [
+    [], {}, {"message": None}, {"message": "bad"}, _local_response("   "),
+    {"error": "model not found"},
+    {"message": {"content": "unfinished"}, "done_reason": "length"},
+    {"message": {"thinking": "not a translation"}, "done": True},
+])
+def test_local_invalid_or_truncated_response_is_not_copied(response):
+    with pytest.raises(tr.TranslationError):
+        tr.translate("Hello", backend="local", post_json=_RecordingPost(response))
+
+
+def test_local_parallel_request_wait_is_bounded():
+    post = _RecordingPost(_local_response())
+    with tr._LOCAL_TRANSLATE_LOCK:
+        with pytest.raises(tr.TranslationError, match="busy"):
+            tr.translate("Hello", backend="local", timeout=0, post_json=post)
+    assert post.calls == []
+
+
+def test_unknown_backend_is_rejected_before_sending_anything():
+    post = _RecordingPost()
+    with pytest.raises(tr.TranslationError, match="TRANSLATE_BACKEND"):
+        tr.translate("Hello", backend="locla", post_json=post)
+    assert post.calls == []

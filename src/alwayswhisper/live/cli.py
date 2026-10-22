@@ -13,6 +13,7 @@ import time
 from . import caption_overlay
 from .transcript_settings import resolve_transcript_directory, resolve_ui_language
 from .terminal_ui import message, print_session_guide
+from .transcription_modes import TRANSLATION_MODES
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-mlx"
 
@@ -35,7 +36,13 @@ def configure_parser(parser):
     parser.add_argument("--list-devices", action="store_true", help="list microphone devices and exit")
     parser.add_argument("--sample-rate", type=positive_float, default=None)
     parser.add_argument("--model", default=DEFAULT_MODEL, help="MLX Whisper model repository")
-    parser.add_argument("--language", default="ja", help="language code, or auto for detection")
+    parser.add_argument("--language", default="ja",
+                        help="ja: Japanese; en: English; en-ja: English to Japanese; "
+                             "ja-en: Japanese to English; auto: detect. Press I on the active island to cycle modes")
+    parser.add_argument("--async-caption-translation", action=argparse.BooleanOptionalAction, default=True,
+                        help="show source captions while local translation runs; Live Input waits for the translation")
+    parser.add_argument("--translate-backend", choices=("local", "openrouter"), default=None,
+                        help="manual translation backend; automatic caption translation uses local Ollama")
     parser.add_argument("--ui-language", choices=("ja", "en"),
                         help="display language, remembered for future runs / 表示言語（記憶します）")
     parser.add_argument("--glossary", type=Path, help="UTF-8 vocabulary/bias prompt file")
@@ -56,7 +63,9 @@ def print_startup(args, directory, microphone, prompt):
     print_session_guide(
         args.ui_language or "en", directory=directory, command="alwayswhisper live",
         recognition_language=args.language, microphone=microphone, model=args.model,
-        prompt=prompt, prompt_file=args.glossary)
+        prompt=prompt, prompt_file=args.glossary,
+        async_caption_translation=(args.captions and args.async_caption_translation
+                                   and args.language in TRANSLATION_MODES))
 
 
 @contextmanager
@@ -111,6 +120,8 @@ def run(args):
             str(directory), prompt=prompt,
             display_queue=display_queue, gate=args.gate,
             max_sec=args.max_sec, silence_sec=args.silence_sec,
+            translate_backend="local",
+            async_caption_translation=args.captions and args.async_caption_translation,
         )
         def callback(indata, frames, timing, status):
             transcriber.feed(indata[:, 0])
@@ -123,6 +134,9 @@ def run(args):
                     caption_overlay.run_console_overlay(
                         display_queue, font_size=args.font_size, position=args.captions_position,
                         level_source=transcriber.get_audio_level,
+                        translate_backend=args.translate_backend,
+                        auto_translate=args.async_caption_translation, language=args.language,
+                        language_change=transcriber.set_language, language_source=transcriber.get_language,
                     )
                 else:
                     while True:

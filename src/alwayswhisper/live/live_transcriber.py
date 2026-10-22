@@ -17,6 +17,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from . import translator
+from .transcription_modes import LANGUAGE_MODES, TRANSLATION_MODES, recognition_language
+
 
 # ---------------------------------------------------------------- pure logic ---
 def resample_to_16k(x, sr):
@@ -517,6 +520,7 @@ class TranscriptWriter:
         self._session_start = datetime.datetime.fromisoformat(meta["started_at"])
         self._model = meta["model"]
         self._language = meta.get("language")
+        self._language_switched = False
         self._out_dir = os.path.dirname(md_path)
         self._md_day = meta["date_str"]  # calendar date of the currently-open md file
         self._paragraph_gap_sec = paragraph_gap_sec  # silence-gap threshold, see class docstring
@@ -547,6 +551,8 @@ class TranscriptWriter:
 
         rec = {"type": "segment", "start": round(float(start_s), 2),
                "end": round(float(end_s), 2), "text": text}
+        if self._language_switched:
+            rec["language"] = self._language
         if wall_start is not None:
             rec["wall"] = wall.isoformat(timespec="seconds")
         self._jsonl_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -622,6 +628,12 @@ class TranscriptWriter:
         self._last_end_s = None
         self._last_wall_end = None
         return True
+
+    def set_language(self, language):
+        """Keep the same session/files and record the mode on subsequent segments."""
+        self.maybe_flush(float("inf"))
+        self._language = language
+        self._language_switched = True
 
     def _rollover(self, day):
         """Switch the currently-open md file to <out_dir>/<day>.md: the
@@ -1218,7 +1230,7 @@ def _make_transcribe_fn(cfg):
             sample_len = decode_sample_len(len(audio16k) / 16000.0)
             options = dict(
                 path_or_hf_repo=model_id,
-                language=cfg["language"],   # "ja" default; None = auto-detect
+                language=recognition_language(cfg["language"]),
                 initial_prompt=cfg.get("prompt"),  # glossary/vocab bias (None = off)
                 condition_on_previous_text=False,
                 word_timestamps=cfg.get("display_mode") == "word",
@@ -1257,20 +1269,34 @@ def _make_transcribe_fn(cfg):
             print(f"[transcribe] qwen engine unavailable ({e}); falling back to whisper", flush=True)
             return _whisper_fn(_WHISPER_FALLBACK_MODEL), "whisper"
 
-        # "auto" is the CLI's spelling of "no language forced" (see
-        # live_avatar._start_transcriber, which already turns it into None
-        # before it ever reaches cfg) -- treated the same way here defensively,
-        # for any cfg built directly (e.g. tests) rather than via that path.
-        language = cfg["language"]
-        if language in (None, "auto"):
-            language = None
-
         def fn(audio16k):
-            result = qmodel.transcribe(audio16k, language=language, context=cfg.get("prompt"))
+            result = qmodel.transcribe(audio16k, language=recognition_language(cfg["language"]), context=cfg.get("prompt"))
             return {"text": result.text}
         return fn, "qwen"
 
     return _whisper_fn(cfg["model"]), "whisper"
+
+
+def _translated_display_text(text, language, backend=None, *, timeout=None):
+    """Translate captions in the requested direction, retaining names as needed.
+
+    A Latin phrase within Japanese also needs translation, with an explicit
+    direction so the manual translate button's toggle cannot turn it English.
+    Fail open: retain the recognized speech when translation is unavailable.
+    """
+    if language not in TRANSLATION_MODES:
+        return text
+    direction = translator.EN_TO_JA if language == "en-ja" else translator.JA_TO_EN
+    if (direction == translator.EN_TO_JA and not translator.needs_japanese_translation(text)
+            or direction == translator.JA_TO_EN and translator.detect_direction(text) != direction):
+        return text
+    try:
+        options = {} if timeout is None else {"timeout": timeout}
+        return translator.translate(text, backend=backend, direction=direction, **options)
+    except translator.TranslationError as exc:
+        print(f"[transcribe] 翻訳に失敗したため原文を表示します: {exc}",
+              file=sys.stderr, flush=True)
+        return text
 
 
 def _emit_display(display_q, event):
@@ -1291,7 +1317,7 @@ def _emit_display(display_q, event):
         pass
 
 
-def _worker(q, cfg, display_q=None):
+def _worker(q, cfg, display_q=None, language_state=None):
     """Child-process entrypoint (must be a module-level function so
     multiprocessing's spawn context can pickle it by reference).
 
@@ -1334,6 +1360,9 @@ def _worker(q, cfg, display_q=None):
     print(f"[transcribe] loading model {cfg['model']} (engine: {cfg.get('engine', 'whisper')}) ...",
           flush=True)
     transcribe_fn, engine = _make_transcribe_fn(cfg)
+    cfg.setdefault("async_caption_translation_enabled", cfg.get("async_caption_translation", False))
+    cfg["async_caption_translation"] = bool(
+        cfg["async_caption_translation_enabled"] and cfg["language"] in TRANSLATION_MODES)
 
     buf = SegmentBuffer(cfg["sr"], silence_sec=cfg["silence_sec"], min_speech_sec=cfg["min_speech_sec"],
                          max_sec=cfg["max_sec"], pre_roll_sec=cfg["pre_roll_sec"],
@@ -1342,6 +1371,7 @@ def _worker(q, cfg, display_q=None):
         cfg["jsonl_path"], cfg["md_path"], cfg["meta"],
         paragraph_gap_sec=cfg.get("paragraph_gap_sec", 60.0),
     )
+    utterance_id = 0
     model_ready = False
     last_display_end_s = None
     display_line_open = False
@@ -1352,7 +1382,7 @@ def _worker(q, cfg, display_q=None):
     audio_t0 = None
 
     def _transcribe_and_write(seg):
-        nonlocal model_ready, last_display_end_s, display_line_open
+        nonlocal model_ready, last_display_end_s, display_line_open, utterance_id
         try:
             audio16k = resample_to_16k(seg.samples, cfg["sr"])
             infer_start = time.time()
@@ -1398,13 +1428,23 @@ def _worker(q, cfg, display_q=None):
             if not text:
                 return  # silence/repetition hallucination -> drop, don't write
             writer.write(seg.start_s, seg.end_s, text, wall_start=seg.wall_start, wall_end=seg.wall_end)
-            # Console echo is the bare transcript only -- no "[transcribe]" label
-            # or timestamp. The jsonl/md files keep full timing (writer.write above).
-            # display_q mirrors this exact stream as ("chunk", text)/("eos",)
-            # events (see _emit_display) for a caption-overlay consumer -- every
-            # print() below that writes display text or closes a display line
-            # has a matching _emit_display() call.
-            if cfg.get("display_mode") == "word":
+            utterance_id += 1
+            display_text = (text if cfg.get("async_caption_translation") else
+                            _translated_display_text(text, cfg["language"], cfg.get("translate_backend")))
+            segment_display_q = None if cfg.get("async_caption_translation") else display_q
+            if cfg.get("async_caption_translation"):
+                _emit_display(display_q, ("chunk", display_text, utterance_id))
+                _emit_display(display_q, ("eos",))
+            if display_text != text:
+                if display_line_open:
+                    print(flush=True)
+                    _emit_display(segment_display_q, ("eos",))
+                print(display_text, flush=True)
+                _emit_display(segment_display_q, ("chunk", display_text))
+                _emit_display(segment_display_q, ("eos",))
+                last_display_end_s = seg.end_s
+                display_line_open = False
+            elif cfg.get("display_mode") == "word":
                 # Word timestamps are requested only for this mode. The
                 # persisted transcript remains one record per speech segment;
                 # this option changes terminal presentation only. Keep words
@@ -1419,27 +1459,27 @@ def _worker(q, cfg, display_q=None):
                     for word, start_s, end_s in words:
                         if display_line_open and last_display_end_s is not None and start_s - last_display_end_s >= 0.7:
                             print(flush=True)
-                            _emit_display(display_q, ("eos",))
+                            _emit_display(segment_display_q, ("eos",))
                             display_line_open = False
                         print(word, end="", flush=True)
-                        _emit_display(display_q, ("chunk", word))
+                        _emit_display(segment_display_q, ("chunk", word))
                         display_line_open = True
                         last_display_end_s = end_s
                         if ends_display_sentence(word):
                             print(flush=True)
-                            _emit_display(display_q, ("eos",))
+                            _emit_display(segment_display_q, ("eos",))
                             display_line_open = False
                 else:
                     # Graceful fallback for an unexpected backend response.
                     print(text, flush=True)
-                    _emit_display(display_q, ("chunk", text))
-                    _emit_display(display_q, ("eos",))
+                    _emit_display(segment_display_q, ("chunk", text))
+                    _emit_display(segment_display_q, ("eos",))
                     last_display_end_s = seg.end_s
                     display_line_open = False
             else:
                 print(text, flush=True)
-                _emit_display(display_q, ("chunk", text))
-                _emit_display(display_q, ("eos",))
+                _emit_display(segment_display_q, ("chunk", text))
+                _emit_display(segment_display_q, ("eos",))
         except Exception as e:  # one bad segment must not kill the transcript
             print(f"[transcribe] segment failed: {e}", flush=True)
 
@@ -1451,6 +1491,31 @@ def _worker(q, cfg, display_q=None):
                 if final is not None:
                     _transcribe_and_write(final)
                 break
+            if (isinstance(item, tuple) and len(item) == 2
+                    and isinstance(item[0], str) and item[0] == "set_language"):
+                language = item[1]
+                if language not in LANGUAGE_MODES:
+                    continue
+                # A marker in the audio FIFO preserves capture order. Complete
+                # the old utterance/corrections before changing the loaded decoder.
+                final = buf.flush()
+                if final is not None:
+                    _transcribe_and_write(final)
+                if display_line_open:
+                    print(flush=True)
+                _emit_display(display_q, ("eos",))
+                display_line_open = False
+                last_display_end_s = None
+                cfg["language"] = language
+                cfg["async_caption_translation"] = bool(
+                    cfg.get("async_caption_translation_enabled",
+                            cfg.get("async_caption_translation")) and language in TRANSLATION_MODES)
+                writer.set_language(language)
+                _emit_display(display_q, ("language", language))
+                if language_state is not None:
+                    language_state.value = LANGUAGE_MODES.index(language) + 1
+                print(f"[transcribe] language → {language}", file=sys.stderr, flush=True)
+                continue
             # (chunk, wall) from LiveTranscriber.feed(), or a bare chunk --
             # see this function's docstring -- from any caller/test that
             # still pushes raw chunks directly.
@@ -1484,7 +1549,7 @@ def _worker(q, cfg, display_q=None):
     finally:
         if display_line_open:
             print(flush=True)  # cleanly terminate a final unterminated phrase at shutdown
-            _emit_display(display_q, ("eos",))
+            _emit_display(None if cfg.get("async_caption_translation") else display_q, ("eos",))
         writer.close()
 
 
@@ -1495,7 +1560,8 @@ class LiveTranscriber:
 
     def __init__(self, sr, model, language, out_dir, prompt=None, engine="whisper", display_mode="word",
                  display_queue=None, timing=False, gate=GATE_DEFAULT,
-                 max_sec=MAX_SEC_DEFAULT, silence_sec=SILENCE_SEC_DEFAULT):
+                 max_sec=MAX_SEC_DEFAULT, silence_sec=SILENCE_SEC_DEFAULT,
+                 translate_backend="local", async_caption_translation=False):
         os.makedirs(out_dir, exist_ok=True)
         started = datetime.datetime.now()
         stamp = started.strftime("%Y%m%d_%H%M%S")
@@ -1527,6 +1593,9 @@ class LiveTranscriber:
             "sr": sr,
             "model": model,
             "language": language,
+            "translate_backend": translate_backend,
+            "async_caption_translation": bool(async_caption_translation and language in TRANSLATION_MODES),
+            "async_caption_translation_enabled": bool(async_caption_translation),
             "engine": engine,   # "whisper" (default) or "qwen" -- see _make_transcribe_fn
             "display_mode": display_mode,  # terminal-only "word" (default) or "sentence"
             # Diagnostic per-segment timing on stderr (--transcribe-timing).
@@ -1564,12 +1633,36 @@ class LiveTranscriber:
         self.dropped = 0
         self._queue = None
         self._proc = None
+        self._language_state = None
 
     def start(self):
         ctx = multiprocessing.get_context("spawn")
         self._queue = ctx.Queue(maxsize=4096)
-        self._proc = ctx.Process(target=_worker, args=(self._queue, self.cfg, self.display_queue), daemon=True)
+        self._language_state = ctx.Value("i", 0)
+        self._proc = ctx.Process(target=_worker,
+                                 args=(self._queue, self.cfg, self.display_queue, self._language_state),
+                                 daemon=True)
         self._proc.start()
+
+
+    def get_language(self):
+        """Applied worker mode, also reliable when the caption queue was full."""
+        code = self._language_state.value if self._language_state is not None else 0
+        return (LANGUAGE_MODES[code - 1] if 1 <= code <= len(LANGUAGE_MODES)
+                else self.cfg["language"] or "auto")
+
+
+    def set_language(self, language):
+        """Enqueue a bounded, nonblocking mode change without restarting capture/model."""
+        if language not in LANGUAGE_MODES:
+            raise ValueError("language must be ja, en, en-ja, or ja-en")
+        if self._queue is None or self._proc is None or not self._proc.is_alive():
+            raise RuntimeError("文字起こしプロセスが動作していません")
+        try:
+            self._queue.put_nowait(("set_language", language))
+        except queue.Full:
+            raise RuntimeError("音声処理キューがいっぱいです。少し待って再度 I を押してください") from None
+        return True
 
     def feed(self, chunk):
         """Called from the PortAudio callback thread: must never block or
