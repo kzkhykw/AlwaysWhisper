@@ -60,6 +60,17 @@ import pytest
 from alwayswhisper.live import caption_overlay as co  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def headless_pointer(monkeypatch):
+    """Pure controller tests must not consult the host desktop or need AppKit.
+
+    Tests for particular pointer positions override this seam themselves;
+    actual window/event behavior is covered in the opt-in native test module.
+    """
+    monkeypatch.setattr(co._OverlayController, "_mouse_location", lambda self: (-99999, -99999))
+    monkeypatch.setitem(sys.modules, "AppKit", None)
+
+
 def test_screen_for_panel_prefers_the_panels_current_display():
     class Panel:
         def screen(self):
