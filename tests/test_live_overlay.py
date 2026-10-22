@@ -1,4 +1,4 @@
-"""Unit tests for the pure-logic half of alwayswhisper.live.caption_overlay.py.
+"""Unit tests for the pure-logic half of alwayswhisper.live.caption_overlay.
 
 CaptionLineModel holds no wall clock and imports no AppKit -- every `now` is
 injected explicitly, exactly like TranscriptWriter's started_at/start_s
@@ -133,6 +133,32 @@ def test_sentence_mode_single_whole_chunk_then_eos():
     m.apply(("chunk", "こんにちは。"), now=0.0)
     m.apply(("eos",), now=0.0)
     assert m.text_at(0.0) == "こんにちは。"
+
+
+def test_replace_overwrites_live_line_after_eos_without_pushing_history():
+    m = _model()
+    m.apply(("chunk", "農舎でデータベースを作ります"), now=0.0)
+    m.apply(("eos",), now=0.2)
+    m.apply(("replace", "Notionでデータベースを作ります"), now=0.8)
+    assert m.text_at(0.8) == "Notionでデータベースを作ります"
+    assert m._history == []
+    assert m._ended is True
+
+
+def test_replace_ignored_before_any_live_text():
+    m = _model()
+    m.apply(("replace", "Notionでデータベースを作ります"), now=0.0)
+    assert m.text_at(0.0) == ""
+    assert m.visible_at(0.0) is False
+
+
+def test_replace_keeps_the_line_visible_past_the_original_idle_window():
+    m = _model(idle_clear_sec=5.0)
+    m.apply(("chunk", "農舎です"), now=0.0)
+    m.apply(("eos",), now=0.1)
+    m.apply(("replace", "Notionです"), now=4.9)
+    assert m.visible_at(9.8) is True
+    assert m.visible_at(9.9) is False
 
 
 # ------------------------------------------------------ full text, no trimming ---
@@ -326,6 +352,19 @@ def test_visible_rows_window_shifts_back_with_scroll_offset():
     ]
 
 
+def test_history_window_can_expand_and_scroll_clamps_to_new_capacity():
+    m = _model()
+    now = _push_lines(m, 10)
+    m.set_history_window(5)
+    assert m.visible_rows(now, expanded=True) == [
+        (f"L{i}", False) for i in range(4, 9)
+    ] + [("L9", True)]
+    m.scroll_by(100, now)
+    assert m.offset_at(now) == 4
+    m.set_history_window(8)
+    assert m.offset_at(now) == 1
+
+
 def test_scroll_by_accepts_fractional_row_delta():
     m = _model()
     now = _push_lines(m, 10)
@@ -485,7 +524,12 @@ def test_alphas_for_extra_history_row_during_fractional_scroll():
 class _FakeScrollEvent:
     """Duck-typed stand-in for NSEvent covering what
     _row_delta_from_scroll_event and _is_command_scroll read:
-    hasPreciseScrollingDeltas(), scrollingDeltaY(), and modifierFlags()."""
+    hasPreciseScrollingDeltas(), scrollingDeltaY(), and modifierFlags().
+    A REAL trackpad/mouse gesture cannot be synthesized in this sandbox
+    (see _row_delta_from_scroll_event's own docstring), so this tests the
+    pure accumulator/threshold/sign arithmetic against controlled inputs
+    -- not the actual hardware-to-sign mapping, which is sourced from
+    Apple's NSEvent.h doc comments instead (see that same docstring)."""
 
     def __init__(self, delta_y, precise=True, command=False):
         self._delta_y = delta_y
@@ -504,7 +548,10 @@ class _FakeScrollEvent:
 
 def test_history_scroll_sign_follows_content_not_scrollbar():
     """Hands-on: the original +1 mapping (swipe-up = older) felt inverted
-    for a chat stack with older rows above the live line."""
+    for a chat stack with older rows above the live line. Natural
+    scrolling moves the CONTENT with the fingers, so swipe-down
+    (negative scrollingDeltaY) must produce a POSITIVE row_delta
+    (further into history). Flip is `_SCROLL_SIGN = -1`."""
     assert co._SCROLL_SIGN == -1
 
 
@@ -544,7 +591,8 @@ def test_row_delta_non_precise_wheel_event_is_scaled_up():
 
 def test_row_delta_cmd_scroll_sign_keeps_scroll_up_as_grow():
     """Cmd+scroll font-size must NOT inherit the history flip: scroll-up
-    still grows the font (positive steps)."""
+    still grows the font (positive steps), matching OverlayGeometry.scale_by
+    and browser zoom."""
     rows, accum = co._row_delta_from_scroll_event(
         _FakeScrollEvent(60.0), 0.0, sign=co._SCALE_SIGN)
     assert co._SCALE_SIGN == 1
@@ -553,7 +601,8 @@ def test_row_delta_cmd_scroll_sign_keeps_scroll_up_as_grow():
 
 
 def test_scroll_rows_from_event_is_continuous_not_quantized():
-    """History scroll must apply every pixel, not wait for a whole row."""
+    """History scroll must apply every pixel, not wait for a whole row.
+    Swipe down 15px (_PX_PER_ROW is 30) is half a row toward older."""
     delta = co._scroll_rows_from_event(_FakeScrollEvent(-15.0))
     assert delta == pytest.approx(0.5)
 
@@ -645,7 +694,7 @@ def test_overlay_geometry_as_dict_roundtrips_through_from_dict():
                            island_width=720.0)
     d = g.as_dict()
     assert d == {"cx_frac": 0.3, "bottom_px": 50.0, "font_size": 40.0,
-                 "position": "free", "island_width": 720.0}
+                 "position": "free", "island_width": 720.0, "island_height": 0.0}
     g2 = co.OverlayGeometry.from_dict(d)
     assert g2.cx_frac == 0.3
     assert g2.bottom_px == 50.0
@@ -667,6 +716,7 @@ def test_overlay_geometry_from_dict_missing_keys_fall_back_to_defaults_per_field
     assert g.bottom_px == 24.0     # missing -> default
     assert g.font_size == 28.0     # missing -> default
     assert g.island_width == 640.0  # older settings files remain usable
+    assert g.island_height == 0.0
 
 
 def test_overlay_geometry_from_dict_non_numeric_values_fall_back_to_defaults():
@@ -691,7 +741,7 @@ def test_overlay_geometry_from_dict_clamps_out_of_range_numerics():
 
 
 # ==================================================== persistence helpers ===
-def test_default_settings_path_is_under_config_video_editor():
+def test_default_settings_path_is_under_config_alwayswhisper():
     path_str = str(co.DEFAULT_SETTINGS_PATH)
     assert path_str.endswith("alwayswhisper/caption_overlay.json")
     assert path_str.startswith(os.path.expanduser("~"))  # already expanduser'd, no literal "~"
@@ -779,7 +829,7 @@ def test_is_command_scroll_false_with_only_unrelated_modifier_bits():
 
 # ------------------------------------------ missing-AppKit friendly failure ---
 # A venv with only requirements-transcribe.txt installed (no
-# requirements-menubar.txt) has no AppKit at all -- --transcribe-only
+# alwayswhisper[live]) has no AppKit at all -- --transcribe-only
 # --captions must not surface a raw ImportError traceback in that case (see
 # _require_appkit's own docstring). sys.modules["AppKit"] = None makes
 # `import AppKit` raise ImportError exactly like a genuinely missing package
@@ -1062,7 +1112,6 @@ def test_tick_hovering_reveals_expanded_history_stack_with_alphas():
         events.append(("eos",))
     events.append(("chunk", "LIVE"))
     controller, renderer, _dq = _controller(events)
-    controller._mouse_location = lambda: (-9999, -9999)
     controller.tick(now=0.0)   # collapsed first (previous test)
 
     controller._hovering = True
@@ -1074,7 +1123,6 @@ def test_tick_hovering_reveals_expanded_history_stack_with_alphas():
 
 def test_tick_holds_while_hovered_and_hides_after_leaving():
     controller, renderer, _dq = _controller([("chunk", "hello"), ("eos",)])
-    controller._mouse_location = lambda: (-9999, -9999)
     controller.tick(now=0.0)
     controller._hovering = True
     controller.tick(now=4.99)
@@ -1147,21 +1195,7 @@ def test_handle_scroll_wheel_swipe_down_scrolls_to_older_history():
 
     controller._handle_scroll_wheel(_FakeScrollEvent(-60.0))  # swipe down
 
-    assert controller.model.offset_at(time.monotonic()) == pytest.approx(2.0)
-
-
-def test_handle_scroll_wheel_swipe_up_from_live_stays_at_live():
-    events = []
-    for i in range(6):
-        events.append(("chunk", f"L{i}"))
-        events.append(("eos",))
-    events.append(("chunk", "LIVE"))
-    controller, _renderer, _dq = _controller(events)
-    controller.tick(now=0.0)
-
-    controller._handle_scroll_wheel(_FakeScrollEvent(60.0))  # swipe up, already at live
-
-    assert controller.model.offset_at(time.monotonic()) == 0
+    assert controller.model.offset_at(time.monotonic()) == pytest.approx(2.0)  # 60px / 30px-per-row
 
 
 def test_handle_scroll_wheel_partial_swipe_moves_fractionally():
@@ -1180,6 +1214,20 @@ def test_handle_scroll_wheel_partial_swipe_moves_fractionally():
     assert controller.model.offset_at(time.monotonic()) == pytest.approx(0.5)
 
 
+def test_handle_scroll_wheel_swipe_up_from_live_stays_at_live():
+    events = []
+    for i in range(6):
+        events.append(("chunk", f"L{i}"))
+        events.append(("eos",))
+    events.append(("chunk", "LIVE"))
+    controller, _renderer, _dq = _controller(events)
+    controller.tick(now=0.0)
+
+    controller._handle_scroll_wheel(_FakeScrollEvent(60.0))  # swipe up, already at live
+
+    assert controller.model.offset_at(time.monotonic()) == 0
+
+
 def test_handle_scroll_wheel_cmd_scroll_up_grows_font():
     """History-sign flip must not reverse Cmd+scroll: swipe-up still grows."""
     controller, _renderer, _dq = _controller([("chunk", "hello")])
@@ -1189,8 +1237,6 @@ def test_handle_scroll_wheel_cmd_scroll_up_grows_font():
 
     assert controller.geometry.font_size == pytest.approx(before * (1.1 ** 2))
 
-
-# ------------------------------------------ controller construction + settings ---
 def test_controller_settings_path_none_uses_font_size_arg_and_never_writes(tmp_path, monkeypatch):
     """settings_path=None disables persistence entirely: geometry comes
     straight from the font_size ARGUMENT (no disk read), and no file is
@@ -1355,7 +1401,6 @@ def test_update_hover_only_calls_setter_on_state_change(monkeypatch):
 
     monkeypatch.setattr(controller, "_update_hover", fake_update_hover)
 
-    controller._mouse_location = lambda: (-9999, -9999)
     controller.tick(now=0.0)   # shows "hi"; hover check #1 -> stays not-hovering, no setter call
     controller.tick(now=0.1)   # hover check #2 -> flips to hovering, setter called once
     controller.tick(now=0.2)   # hover check #3 -> still hovering, no additional setter call
@@ -1806,6 +1851,8 @@ def test_compute_layout_fractional_scroll_shifts_history_toward_live():
         with_extra, 28.0, None, frame, geometry, scroll_frac=0.5)
     live_y0, live_y1 = chips0[-1][1], chips1[-1][1]
     assert live_y1 == pytest.approx(live_y0)
+    # History (not live) moves toward the live row: in bottom-up coords that
+    # is a smaller chip_y. Extra starts outside/at the far edge and peeks in.
     assert chips1[1][1] < chips0[1][1]   # h1 closer to live
     assert chips1[0][1] < chips0[0][1]   # extra closer to live / entering
 
@@ -2729,7 +2776,8 @@ def test_handle_mouse_drag_repositions_panel_frame_via_drag_reposition_origin(mo
     # time _handle_mouse_drag reaches the reposition block, so recomputing
     # against controller.geometry NOW matches what the method itself used.
     expected_x, expected_y = co._drag_reposition_origin(
-        visible, frame.size.width, frame.size.height, controller.geometry.font_size, controller.geometry)
+        visible, frame.size.width, frame.size.height, controller.geometry.font_size,
+        controller.geometry, left_action=True)
     assert len(panel.set_frame_origin_calls) == 1
     actual_x, actual_y = panel.set_frame_origin_calls[0]
     assert actual_x == pytest.approx(expected_x)
@@ -2786,7 +2834,7 @@ def test_icon_click_then_mouse_up_does_not_write_settings(tmp_path):
 # ================================================== controller: translate icon ===
 # The translate icon sits immediately right of the copy icon on the hovered
 # row and puts the TRANSLATION on the clipboard (Japanese -> English, anything
-# else -> Japanese; see alwayswhisper.live.translator.py). Unlike copying, it is a
+# else -> Japanese; see alwayswhisper.live.translator). Unlike copying, it is a
 # network call, so the controller runs it off the UI thread and picks the
 # result up on a later tick(). Every test here injects run_async=_run_inline,
 # which runs that "thread" synchronously: the result still travels through the
@@ -2808,6 +2856,20 @@ def test_controller_defaults_translate_fn_to_translator_translate():
         _FakeDisplayQueue([]), font_size=28, renderer=_FakeRenderer(), settings_path=None)
 
     assert controller._translate_fn is translator.translate
+
+
+@pytest.mark.parametrize("backend", ["local", "openrouter"])
+def test_controller_passes_selected_translation_backend(monkeypatch, backend):
+    calls = []
+    def fake_translate(text, **kwargs):
+        calls.append((text, kwargs))
+        return "translated"
+    monkeypatch.setattr(co.translator, "translate", fake_translate)
+    controller = co._OverlayController(
+        _FakeDisplayQueue([]), renderer=_FakeRenderer(), settings_path=None,
+        translate_backend=backend)
+    assert controller._translate_fn("hello") == "translated"
+    assert calls == [("hello", {"backend": backend})]
 
 
 def test_mouse_down_on_the_translate_icon_translates_and_does_not_copy_or_drag():
@@ -2940,17 +3002,12 @@ def test_clicking_again_while_the_same_row_is_in_flight_does_not_ask_twice():
     assert controller._translate_inflight == {"こんにちは"}   # ...but exactly one is registered
 
 
-def test_a_finished_row_can_be_translated_again():
-    """The in-flight guard is released once the result has been applied --
-    it exists to stop DUPLICATE requests, not to make a row translate only
-    once. Driven through a real repaint (a display event plus
-    _FakeRendererWithBoxes) rather than by assigning _row_boxes directly,
-    because the tick() in between rebuilds that list from the repaint."""
-    asked = []
+def test_a_finished_row_copies_cached_translation_immediately_on_repeat_click():
+    asked, copied = [], []
     renderer = _FakeRendererWithBoxes(_translate_boxes())
     controller = co._OverlayController(
         _FakeDisplayQueue([("chunk", "こんにちは")]), font_size=28, renderer=renderer,
-        settings_path=None, copy_fn=lambda text: True,
+        settings_path=None, copy_fn=lambda text: copied.append(text) or True,
         translate_fn=lambda text: asked.append(text) or "Hello",
         run_async=_run_inline)
     controller.tick(now=0.0)
@@ -2959,9 +3016,10 @@ def test_a_finished_row_can_be_translated_again():
     controller._handle_mouse_down(None)
     controller.tick(now=1.0)
     controller._handle_mouse_down(None)
+    assert copied == ["Hello", "Hello"]  # no second worker or display tick needed
     controller.tick(now=2.0)
 
-    assert asked == ["こんにちは", "こんにちは"]
+    assert asked == ["こんにちは"]
 
 
 def test_global_mouse_down_translates_when_the_click_is_inside_the_translate_icon():
@@ -3052,6 +3110,211 @@ def test_translate_state_reaches_the_renderer_as_decor():
     assert decor.translate_state == "done"
 
 
+@pytest.mark.parametrize("position", ["dynamic-island", "notch"])
+@pytest.mark.parametrize("clipboard_ok", [True, False])
+def test_island_translation_updates_display_and_preserves_recognition(position, clipboard_ok):
+    renderer = _FakeRendererWithBoxes(_translate_boxes())
+    copied = []
+    dq = _FakeDisplayQueue([("chunk", "こんにちは")])
+    controller = co._OverlayController(
+        dq, renderer=renderer, settings_path=None, position=position,
+        copy_fn=lambda text: copied.append(text) or clipboard_ok,
+        translate_fn=lambda text: "Hello", run_async=_run_inline)
+    controller.tick(now=0)
+    controller._mouse_location = lambda: (90, 15)
+    controller._handle_mouse_down(None)
+    controller.tick(now=0.1)
+    assert renderer.calls[-1][1] == [("Hello", True)]
+    assert renderer.calls[-1][5].translate_text == "Hello"
+    assert copied == ["Hello"]
+    assert controller.model._text == "こんにちは"
+    controller.tick(now=2)
+    assert renderer.calls[-1][1] == [("Hello", True)]
+
+    # Recognition continues in the original language, without mixed text.
+    dq.push(("chunk", "皆さん"))
+    controller.tick(now=2.1)
+    assert renderer.calls[-1][1] == [("こんにちは皆さん", True)]
+    assert controller._translated_rows == {}
+
+
+def test_delayed_island_translation_updates_history_without_overwriting_new_speech():
+    workers, asked, copied = [], [], []
+    renderer = _FakeRendererWithBoxes(_translate_boxes())
+    dq = _FakeDisplayQueue([("chunk", "こんにちは"), ("eos",)])
+    controller = co._OverlayController(
+        dq, renderer=renderer, settings_path=None, position="dynamic-island",
+        copy_fn=lambda text: copied.append(text) or True,
+        translate_fn=lambda text: asked.append(text) or "Hello",
+        run_async=workers.append)
+    controller.tick(now=0)
+    controller._mouse_location = lambda: (90, 15)
+    controller._hovering = True
+    controller._handle_mouse_down(None)
+    dq.push(("chunk", "次の発話"))
+    controller.tick(now=0.1)
+    workers.pop()()
+    controller.tick(now=0.2)
+    assert renderer.calls[-1][1] == [("Hello", False), ("次の発話", True)]
+    assert controller.model._history == ["こんにちは"]
+    # Both buttons reuse the translated history row without another request.
+    controller._row_boxes = _translate_boxes(text="Hello")
+    controller._mouse_location = lambda: (70, 15)
+    controller._handle_mouse_down(None)
+    assert copied == ["Hello", "Hello"]
+    controller._mouse_location = lambda: (90, 15)
+    controller._handle_mouse_down(None)
+    assert workers == []
+    assert asked == ["こんにちは"]
+    assert copied == ["Hello", "Hello", "Hello"]
+
+
+def test_automatic_local_translation_shows_english_then_replaces_it_without_clipboard():
+    workers, copied, calls = [], [], []
+    renderer = _FakeRendererWithBoxes(_translate_boxes())
+    dq = _FakeDisplayQueue([("chunk", "Let's start the meeting.", 1), ("eos",)])
+    controller = co._OverlayController(
+        dq, renderer=renderer, settings_path=None, position="dynamic-island",
+        auto_translate=True,
+        auto_translate_fn=lambda text: calls.append(text) or "会議を始めましょう。",
+        run_async=workers.append, copy_fn=lambda text: copied.append(text) or True)
+
+    controller.tick(now=0)
+    assert renderer.calls[-1][1] == [("Let's start the meeting.", True)]
+    assert len(workers) == 1
+    assert calls == []  # translation has not held up the English caption
+
+    workers.pop()()
+    controller.tick(now=6)  # completion revives a caption past its idle timer
+    assert renderer.calls[-1][1] == [("会議を始めましょう。", True)]
+    assert controller.model._text == "Let's start the meeting."
+    assert calls == ["Let's start the meeting."]
+    assert copied == []
+
+
+def test_automatic_translation_updates_old_row_without_replacing_new_speech():
+    workers = []
+    renderer = _FakeRendererWithBoxes(_translate_boxes())
+    dq = _FakeDisplayQueue([("chunk", "How are you?", 1), ("eos",)])
+    controller = co._OverlayController(
+        dq, renderer=renderer, settings_path=None, position="dynamic-island",
+        auto_translate=True, auto_translate_fn=lambda text: "お元気ですか？",
+        run_async=workers.append)
+    controller.tick(now=0)
+    dq.push(("chunk", "今日は会議です", 2))
+    dq.push(("eos",))
+    controller._hovering = True
+    controller.tick(now=0.1)
+    workers.pop()()
+    controller.tick(now=0.2)
+    assert controller.model._history == ["How are you?"]
+    assert controller.model._text == "今日は会議です"
+    assert renderer.calls[-1][1] == [("お元気ですか？", False), ("今日は会議です", True)]
+
+
+def test_automatic_translation_uses_local_backend(monkeypatch):
+    calls = []
+
+    def translate(text, **kwargs):
+        calls.append((text, kwargs))
+        return "こんにちは"
+
+    monkeypatch.setattr(co.translator, "translate", translate)
+    controller = co._OverlayController(
+        _FakeDisplayQueue([("chunk", "Hello", 1), ("eos",)]),
+        renderer=_FakeRendererWithBoxes(_translate_boxes()), settings_path=None,
+        position="dynamic-island", auto_translate=True, run_async=_run_inline)
+    controller.tick(now=0)
+    controller.tick(now=0.1)
+    assert calls == [("Hello", {"backend": "local", "direction": co.translator.EN_TO_JA})]
+
+
+def test_automatic_translation_handles_english_phrase_inside_japanese():
+    workers = []
+    controller = co._OverlayController(
+        _FakeDisplayQueue([("chunk", "では let's start the meeting.", 1), ("eos",)]),
+        renderer=_FakeRendererWithBoxes(_translate_boxes()), settings_path=None,
+        position="dynamic-island", auto_translate=True,
+        auto_translate_fn=lambda text: "では会議を始めましょう。",
+        run_async=workers.append)
+    controller.tick(now=0)
+    assert len(workers) == 1
+    workers.pop()()
+    controller.tick(now=0.1)
+    assert controller._translated_rows["では let's start the meeting."] == "では会議を始めましょう。"
+
+
+def test_automatic_translation_queue_keeps_recent_speech_when_local_model_is_slow():
+    workers = []
+    dq = _FakeDisplayQueue()
+    controller = co._OverlayController(
+        dq, renderer=_FakeRendererWithBoxes(_translate_boxes()),
+        settings_path=None, position="dynamic-island", auto_translate=True,
+        auto_translate_fn=lambda text: "日本語", run_async=workers.append)
+    for index, source in enumerate(("One.", "Two.", "Three.", "Four."), 1):
+        dq.push(("chunk", source, index))
+        dq.push(("eos",))
+    controller.tick(now=0)
+    assert controller._auto_active == "One."
+    assert list(controller._auto_pending) == ["Three.", "Four."]
+    assert len(workers) == 1
+
+
+def test_translation_completion_copies_before_display_tick_and_relayout():
+    workers, main_callbacks, copied = [], [], []
+    renderer = _FakeRendererWithBoxes(_translate_boxes())
+    controller = co._OverlayController(
+        _FakeDisplayQueue([("chunk", "こんにちは")]), renderer=renderer,
+        settings_path=None, position="dynamic-island",
+        copy_fn=lambda text: copied.append(text) or True,
+        translate_fn=lambda text: "Hello", run_async=workers.append,
+        schedule_main=main_callbacks.append)
+    controller.tick(now=0)
+    controller._mouse_location = lambda: (90, 15)
+    controller._handle_mouse_down(None)
+    workers.pop()()
+    assert copied == []  # the worker must not write to AppKit
+    assert len(main_callbacks) == 1
+    main_callbacks.pop()()
+    assert copied == ["Hello"]
+    assert renderer.calls[-1][1] == [("こんにちは", True)]
+    controller.tick(now=0.1)
+    assert renderer.calls[-1][1] == [("Hello", True)]
+    assert copied == ["Hello"]  # tick must not deliver the same result twice
+
+
+def test_translation_main_callback_does_not_copy_after_panel_closes():
+    main_callbacks, copied = [], []
+    controller = co._OverlayController(
+        None, renderer=_FakeRenderer(), settings_path=None,
+        copy_fn=lambda text: copied.append(text) or True,
+        translate_fn=lambda text: "Hello", run_async=_run_inline,
+        schedule_main=main_callbacks.append)
+    controller._start_translate(_translate_boxes()[0], "mouseDown")
+    controller.close()
+    main_callbacks.pop()()
+    assert copied == []
+
+
+def test_translation_tick_fallback_delivers_before_display_events_when_scheduling_fails():
+    events = []
+
+    def unavailable(callback):
+        raise RuntimeError("main loop unavailable")
+
+    dq = _FakeDisplayQueue([("chunk", "こんにちは")])
+    controller = co._OverlayController(
+        dq, renderer=_FakeRenderer(), settings_path=None,
+        copy_fn=lambda text: events.append("copy") or True,
+        translate_fn=lambda text: "Hello", run_async=_run_inline,
+        schedule_main=unavailable)
+    apply = controller.model.apply
+    controller.model.apply = lambda event, now: (events.append("display"), apply(event, now))
+    controller._start_translate(_translate_boxes()[0], "mouseDown")
+    controller.tick(now=0)
+    assert events == ["copy", "display"]
+
+
 # Floating panel controls: actual controller callbacks, no WindowServer needed.
 def test_close_hover_hides_immediately_and_next_chunk_restores_under_same_cursor():
     controller, renderer, dq = _controller([("chunk", "hello"), ("eos",)])
@@ -3140,7 +3403,6 @@ def test_corner_hover_does_not_expand_history_and_move_grip():
 
 def test_hover_entry_at_idle_deadline_is_checked_before_hiding(monkeypatch):
     controller, renderer, _ = _controller([("chunk", "hello"), ("eos",)])
-    controller._mouse_location = lambda: (-9999, -9999)
     controller.tick(now=0.0)
     def enter_panel():
         controller._hovering = True
@@ -3345,6 +3607,259 @@ def test_docked_body_cannot_arm_move_gesture():
     assert controller._drag_base is None
 
 
+def test_live_input_icon_toggles_without_moving_or_copying():
+    class FakeLiveInput:
+        active = False
+        error = None
+        def toggle(self):
+            self.active = not self.active
+            return self.active
+        def feed(self, *args, **kwargs):
+            pass
+        def flush(self):
+            pass
+
+    mode = FakeLiveInput()
+    copied = []
+    renderer = _FakeRendererWithBoxes([
+        co.RowBox(0, "字幕", (0, 0, 200, 40), (130, 0, 30, 40),
+                  (160, 0, 30, 40), (0, 0, 40, 40))])
+    renderer.live_input_frame = (0, 50, 20, 20)
+    controller = co._OverlayController(
+        _FakeDisplayQueue([("chunk", "字幕")]), renderer=renderer, settings_path=None,
+        position="notch", live_input_session=mode,
+        copy_fn=lambda text: copied.append(text) or True)
+    controller.tick(now=0)
+    controller._mouse_location = lambda: (10, 60)
+    controller._handle_mouse_down(None)
+    assert mode.active and not controller._dragging and copied == []
+    controller._handle_mouse_down(None)
+    assert not mode.active
+
+
+def _shortcut_event(key, flags=0, repeat=False):
+    from types import SimpleNamespace
+    return SimpleNamespace(charactersIgnoringModifiers=lambda: key,
+                           modifierFlags=lambda: flags, isARepeat=lambda: repeat)
+
+
+def test_island_keyboard_shortcuts_require_focus_and_ignore_repeat_and_modifiers():
+    from types import SimpleNamespace
+    from test_live_input import FakeInput
+    mode = co.live_input.LiveInputSession(lambda: FakeInput())
+    c = co._OverlayController(None, renderer=_FakeRenderer(), settings_path=None,
+                              position="dynamic-island", live_input_session=mode)
+    focused = [False]
+    c.renderer.panel = SimpleNamespace(isKeyWindow=lambda: focused[0],
+                                       resignKeyWindow=lambda: focused.__setitem__(0, False))
+    c._panel_visible = True
+    assert not c._handle_key_down(_shortcut_event("l")) and not mode.active
+    focused[0] = True
+    for flags in (1 << 20, 1 << 19, 1 << 18):
+        assert not c._handle_key_down(_shortcut_event("l", flags))
+    assert c._handle_key_down(_shortcut_event("l", repeat=True)) and not mode.active
+    assert c._handle_key_down(_shortcut_event("L", 1 << 17))
+    assert mode.active and not focused[0]  # dictation immediately returns focus
+    focused[0] = True
+    assert c._handle_key_down(_shortcut_event("l")) and not mode.active
+    c._closed = True
+    assert not c._handle_key_down(_shortcut_event("l"))
+
+
+def test_language_shortcut_waits_for_ack_and_discards_old_automatic_translation():
+    from types import SimpleNamespace
+    workers, requests = [], []
+    q = _FakeDisplayQueue([("chunk", "今日は晴れです。", 1), ("eos",)])
+    c = co._OverlayController(q, renderer=_FakeRenderer(), settings_path=None,
+                              position="dynamic-island", language="ja-en", auto_translate=True,
+                              language_change=lambda lang: requests.append(lang) or True,
+                              run_async=workers.append, auto_translate_fn=lambda text: "Sunny today.")
+    c.tick(now=0)
+    assert len(workers) == 1
+    c.renderer.panel = SimpleNamespace(isKeyWindow=lambda: True)
+    assert c._handle_key_down(_shortcut_event("i"))
+    assert c._language_pending == "ja" and c._language == "ja-en"
+    c._handle_key_down(_shortcut_event("i"))
+    assert requests == ["ja"]
+    c.renderer.panel = None
+    q.push(("language", "ja"))
+    c.tick(now=1)
+    assert c._language == "ja" and c._language_pending is None and not c._auto_translate
+    workers.pop()()
+    c.tick(now=1.1)
+    assert c.renderer.calls[-1][1][-1] == ("今日は晴れです。", True)
+    assert c.renderer.calls[-1][-1].language == "ja"
+    assert c._translated_rows == {}
+    q.push(("language", "en-ja"))
+    c.tick(now=2)
+    assert c._auto_translate
+
+
+def test_language_ack_fallback_and_failed_request_preserve_applied_mode():
+    from types import SimpleNamespace
+    c = co._OverlayController(None, renderer=_FakeRenderer(), settings_path=None,
+                              position="dynamic-island", language="ja",
+                              language_change=lambda lang: True, language_source=lambda: "en")
+    c._panel_visible = True
+    c.renderer.panel = SimpleNamespace(isKeyWindow=lambda: True)
+    c._handle_key_down(_shortcut_event("i"))
+    c.renderer.panel = None
+    c.tick(now=0)
+    assert c._language == "en" and c._language_pending is None
+    def fail(language):
+        raise RuntimeError("queue full")
+    c._language_change = fail
+    c.renderer.panel = SimpleNamespace(isKeyWindow=lambda: True)
+    assert c._handle_key_down(_shortcut_event("i"))
+    assert c._language == "en" and c._language_pending is None
+
+
+@pytest.mark.parametrize("language,source,translation", [
+    ("en-ja", "Let's start the meeting.", "会議を\n始めましょう。"),
+    ("ja-en", "会議を始めましょう。", "Let's start\nthe meeting."),
+])
+def test_live_input_waits_for_translation_and_types_only_output_language(language, source, translation, monkeypatch):
+    from test_live_input import FakeInput
+    field, workers, calls = FakeInput(), [], []
+    session = co.live_input.LiveInputSession(lambda: field)
+    session.toggle()
+    def translate(text, **kwargs):
+        calls.append((text, kwargs["direction"]))
+        return translation
+    monkeypatch.setattr(co.translator, "translate", translate)
+    q = _FakeDisplayQueue([("chunk", source, 1), ("eos",)])
+    c = co._OverlayController(q, renderer=_FakeRenderer(), settings_path=None,
+        position="dynamic-island", language=language, auto_translate=True,
+        run_async=workers.append, live_input_session=session)
+    c.tick(now=0)
+    assert field.values["a"] == ""  # source preview must never be typed
+    workers.pop(0)()
+    c.tick(now=1)
+    expected = co.live_input._single_line(translation)
+    assert field.values["a"] == expected
+    direction = co.translator.EN_TO_JA if language == "en-ja" else co.translator.JA_TO_EN
+    assert calls == [(source, direction)]
+    # Repeated speech reuses the rendered translation and still types it once.
+    q.push(("chunk", source, 2)); q.push(("eos",))
+    c.tick(now=2)
+    separator = co.live_input._separator(expected[-1], expected)
+    assert field.values["a"] == expected + separator + expected
+    assert not workers and len(calls) == 1
+
+
+@pytest.mark.parametrize("outcome", ["failure", "echo", "off-on", "mode-change"])
+def test_live_input_never_inserts_untranslated_or_cancelled_results(outcome):
+    from test_live_input import FakeInput
+    field, workers = FakeInput(), []
+    session = co.live_input.LiveInputSession(lambda: field)
+    session.toggle()
+    def translate(text):
+        if outcome == "failure":
+            raise RuntimeError("offline")
+        return text if outcome == "echo" else "会議を始めましょう。"
+    c = co._OverlayController(_FakeDisplayQueue([("chunk", "Let's start the meeting.", 1), ("eos",)]),
+        renderer=_FakeRenderer(), settings_path=None, language="en-ja", auto_translate=True,
+        auto_translate_fn=translate, run_async=workers.append, live_input_session=session)
+    c.tick(now=0)
+    if outcome == "off-on":
+        c._toggle_live_input(); c._toggle_live_input()
+    elif outcome == "mode-change":
+        c._apply_language("ja")
+    workers.pop()()
+    c.tick(now=1)
+    assert field.values["a"] == ""
+    assert not c._live_translation_pending
+
+
+def test_live_input_translated_correction_updates_only_its_own_latest_span():
+    from test_live_input import FakeInput
+    field, workers = FakeInput(), []
+    session = co.live_input.LiveInputSession(lambda: field)
+    session.toggle()
+    translations = {"今日は雨です。": "It is rainy.", "今日は晴れです。": "It is sunny."}
+    q = _FakeDisplayQueue([("chunk", "今日は雨です。", 1), ("eos",)])
+    c = co._OverlayController(q, renderer=_FakeRenderer(), settings_path=None,
+        language="ja-en", auto_translate=True, auto_translate_fn=translations.__getitem__,
+        run_async=workers.append, live_input_session=session)
+    c.tick(now=0); workers.pop()(); c.tick(now=1)
+    assert field.values["a"] == "It is rainy."
+    q.push(("replace", "今日は晴れです。", 1))
+    c.tick(now=2)
+    assert field.values["a"] == "It is rainy."
+    workers.pop()(); c.tick(now=3)
+    assert field.values["a"] == "It is sunny."
+
+
+def test_new_translation_of_same_speech_waits_for_old_mode_job_without_using_it():
+    from test_live_input import FakeInput
+    field, workers = FakeInput(), []
+    session = co.live_input.LiveInputSession(lambda: field)
+    session.toggle()
+    source = "今日は晴れです。"
+    q = _FakeDisplayQueue([("chunk", source, 1), ("eos",)])
+    c = co._OverlayController(q, renderer=_FakeRenderer(), settings_path=None,
+        language="ja-en", auto_translate=True, auto_translate_fn=lambda _: "It is sunny.",
+        run_async=workers.append, live_input_session=session)
+    c.tick(now=0)
+    c._apply_language("ja"); c._apply_language("ja-en")
+    q.push(("chunk", source, 2)); q.push(("eos",))
+    c.tick(now=1)
+    workers.pop(0)(); c.tick(now=2)
+    assert field.values["a"] == "" and len(workers) == 1
+    workers.pop(0)(); c.tick(now=3)
+    assert field.values["a"] == "It is sunny."
+
+
+@pytest.mark.parametrize("language,text,expected", [
+    ("en-ja", "会議を始めましょう。", "会議を始めましょう。"),
+    ("ja-en", "Let's start the meeting.", "Let's start the meeting."),
+    ("en-ja", "Let's start the meeting.", ""),
+    ("ja-en", "会議を始めましょう。", ""),
+])
+def test_live_input_sync_translation_does_not_type_source_fallback(language, text, expected):
+    from test_live_input import FakeInput
+    field = FakeInput()
+    session = co.live_input.LiveInputSession(lambda: field)
+    session.toggle()
+    c = co._OverlayController(_FakeDisplayQueue([("chunk", text), ("eos",)]),
+        renderer=_FakeRenderer(), settings_path=None, language=language,
+        auto_translate=False, live_input_session=session)
+    c.tick(now=0)
+    assert field.values["a"] == expected
+
+
+def test_island_direct_input_remains_on_through_dismissal_and_idle_until_toggled_off():
+    from test_live_input import FakeInput
+    field = FakeInput()
+    mode = co.live_input.LiveInputSession(lambda: field)
+    q = queue.Queue()
+    renderer = _FakeRenderer()
+    renderer.live_input_frame = (0, 50, 20, 20)
+    controller = co._OverlayController(q, renderer=renderer, settings_path=None,
+                                       position="dynamic-island", live_input_session=mode)
+    controller._mouse_location = lambda: (10, 60)
+    controller.tick(now=0)
+    # The pencil works before the first caption, without pinning the island.
+    controller._handle_mouse_down(None)
+    assert mode.active and not controller._pinned
+    q.put(("chunk", "最初の文。", 1))
+    q.put(("eos",))
+    controller.tick(now=1)
+    controller.tick(now=10)
+    assert mode.active
+    controller._dismiss()
+    assert mode.active and renderer.calls[-1][-1].live_input_active
+    q.put(("chunk", "次の\n文。", 2))
+    q.put(("eos",))
+    controller.tick(now=11)
+    assert field.values["a"] == "最初の文。次の文。"
+    controller._handle_mouse_down(None)
+    assert not mode.active
+    q.put(("chunk", "入力しない", 3))
+    controller.tick(now=12)
+    assert field.values["a"] == "最初の文。次の文。"
+
+
 def test_display_geometry_change_triggers_repaint_without_new_words():
     renderer = _FakeRenderer()
     screen = [0, 0, 1512, 950]
@@ -3390,6 +3905,37 @@ def test_island_caption_width_is_fixed_for_short_and_long_text():
                                 geometry=geometry)[0][2]
               for text, measured_width in (("短い", 50), ("long caption", 480))]
     assert widths == [700, 700]
+    assert co._island_layout([("short", 50, 34)], 28, None, anchor,
+                             geometry=co.OverlayGeometry(position="notch"))[0][2] == 640
+
+
+def test_island_live_input_stays_in_header_clear_of_camera_and_close():
+    anchor = co.IslandAnchor(900, 1169, 220, 38, 1800)
+    rect, _, boxes = co._island_layout([("live", 80, 34)], 28, 0, anchor)
+    assert boxes[0].live_input_icon is None
+    for sizes in ([], [("live", 80, 34)]):
+        frame, _, _ = co._island_layout(sizes, 28, None, anchor)
+        x, y, w, h = co._island_live_input_rect(frame, anchor)
+        assert frame[0] <= x and x + w <= anchor.center_x - anchor.camera_width / 2
+        assert anchor.top - anchor.header_height <= y and y + h <= anchor.top
+        if sizes:
+            close, _ = co._overlay_controls(frame)
+            assert x >= close[0] + close[2]
+
+
+def test_floating_live_input_area_does_not_move_text_on_hover():
+    frame = _FakeFrame(0, 0, 2000, 1000)
+    geometry = co.OverlayGeometry()
+    plain, chips_plain, _ = co._compute_layout(
+        [("live", 120, 30)], 28, None, frame, geometry, left_action=True)
+    hovered, chips_hovered, boxes = co._compute_layout(
+        [("live", 120, 30)], 28, 0, frame, geometry, left_action=True)
+    reserve = co._icon_reserve_for(28)[0] + co._PAD_X
+    assert plain == hovered
+    assert boxes[0].live_input_icon[0] == hovered[0]
+    # The chip expands to the left; its label moves right by the same amount.
+    assert chips_hovered[0][0] + reserve == chips_plain[0][0]
+    assert co._hit_icon((boxes[0].icon[0] + 2, boxes[0].icon[1] + 2), boxes) is boxes[0]
 
 
 def test_island_width_clamps_to_screen_and_camera():
@@ -3402,8 +3948,67 @@ def test_island_resize_edge_only_hits_body_borders():
     frame = (100, 200, 640, 90)
     assert co._island_resize_edge((105, 220), frame, 38) == "left"
     assert co._island_resize_edge((735, 220), frame, 38) == "right"
-    assert co._island_resize_edge((105, 270), frame, 38) is None
+    assert co._island_resize_edge((105, 270), frame, 38) is None  # camera / top controls
     assert co._island_resize_edge((200, 220), frame, 38) is None
+
+
+def test_island_bottom_grip_excludes_width_grips():
+    frame = (100, 200, 640, 90)
+    assert co._island_resize_bottom((420, 205), frame)
+    assert not co._island_resize_bottom((105, 205), frame)
+    assert not co._island_resize_bottom((420, 220), frame)
+
+
+def test_island_height_controls_history_and_keeps_top_anchored():
+    anchor = co.IslandAnchor(900, 1169, 220, 38, 1800)
+    geometry = co.OverlayGeometry(position="notch", island_height=300)
+    capacity = co._island_history_window(geometry, anchor)
+    assert capacity > co.CaptionLineModel.HISTORY_WINDOW
+    rows = [(f"row {i}", 120, 34) for i in range(capacity + 1)]
+    rect, _, boxes = co._island_layout(rows, 28, None, anchor, geometry=geometry)
+    assert rect[3] == pytest.approx(300)
+    assert rect[1] + rect[3] == pytest.approx(anchor.top)
+    assert boxes[-1].frame[1] >= rect[1]
+    assert len(co._alphas_for([(text, i == len(rows) - 1) for i, (text, *_rest) in enumerate(rows)])) == len(rows)
+
+
+def test_island_height_drag_resizes_and_persists(tmp_path):
+    anchor = co.IslandAnchor(420, 982, 220, 38, 840)
+    renderer = _FakeRendererWithBoxes([co.RowBox(0, "字幕", (100, 200, 640, 52))])
+    renderer.control_frame = (100, 200, 640, 90)
+    renderer.screen_state = lambda geometry: anchor
+    path = tmp_path / "geometry.json"
+    controller = co._OverlayController(_FakeDisplayQueue([("chunk", "字幕")]),
+                                       renderer=renderer, settings_path=path,
+                                       position="notch")
+    controller.tick(now=0)
+    mouse = [420, 205]
+    controller._mouse_location = lambda: tuple(mouse)
+    controller._handle_mouse_down(None)
+    assert controller._height_resize_base is not None
+    assert controller._width_resize_base is None
+    mouse[1] -= 170
+    controller._handle_mouse_drag(None)
+    assert controller.geometry.island_height == 260
+    assert controller.model.history_window > co.CaptionLineModel.HISTORY_WINDOW
+    controller._handle_mouse_up(None)
+    assert controller._height_resize_base is None
+    assert co.load_geometry(path).island_height == 260
+
+
+def test_resized_island_keeps_extra_history_visible_without_hover():
+    anchor = co.IslandAnchor(420, 982, 220, 38, 840)
+    renderer = _FakeRenderer()
+    renderer.screen_state = lambda geometry: anchor
+    events = []
+    for i in range(8):
+        events.extend([("chunk", f"line {i}"), ("eos",)])
+    controller = co._OverlayController(_FakeDisplayQueue(events), renderer=renderer,
+                                       settings_path=None, position="notch")
+    controller.geometry.island_height = 300
+    controller.tick(now=0)
+    assert len(renderer.calls[-1][1]) > 3
+    assert renderer.calls[-1][1][-1] == ("line 7", True)
 
 
 @pytest.mark.parametrize("edge,start_x,drag_dx", [("left", 105, -40), ("right", 735, 40)])
@@ -3416,16 +4021,15 @@ def test_island_edge_drag_resizes_and_persists(edge, start_x, drag_dx, tmp_path)
     controller = co._OverlayController(_FakeDisplayQueue([("chunk", "字幕")]),
                                        renderer=renderer, settings_path=path,
                                        position="notch")
-    mouse = [-9999, -9999]
-    controller._mouse_location = lambda: tuple(mouse)
     controller.tick(now=0)
-    mouse[:] = [start_x, 220]
+    mouse = [start_x, 220]
+    controller._mouse_location = lambda: tuple(mouse)
     controller._handle_mouse_down(None)
     assert controller._width_resize_base[2] == edge
     assert controller._drag_base is None
     mouse[0] += drag_dx
     controller._handle_mouse_drag(None)
-    assert controller.geometry.island_width == 720
+    assert controller.geometry.island_width == 720  # centered: each edge moves 40pt
     assert renderer.calls[-1][4].island_width == 720
     controller._handle_mouse_up(None)
     assert controller._width_resize_base is None
@@ -3475,7 +4079,6 @@ def test_island_lifecycle_compact_before_speech_and_after_idle():
     renderer = _FakeRenderer()
     dq = _FakeDisplayQueue([])
     controller = co._OverlayController(dq, renderer=renderer, settings_path=None, position="dynamic-island")
-    controller._mouse_location = lambda: (-9999, -9999)
     controller.tick(now=0)
     assert renderer.calls[-1][0] == "show" and renderer.calls[-1][1] == []
     assert controller._panel_visible
@@ -3520,3 +4123,22 @@ def test_audio_meter_silence_invalid_data_and_full_scale():
     rects = co._audio_bar_rects(meter.level)
     assert rects[2][3] > rects[1][3] > rects[0][3]
     assert all(0 <= x <= 20 - w and 0 <= y <= 20 - h for x, y, w, h in rects)
+
+
+def test_delayed_correction_cannot_overwrite_newer_identical_utterance():
+    m = co.CaptionLineModel()
+    m.apply(("chunk", "同じ発話", 1), now=0)
+    m.apply(("eos",), now=0.1)
+    m.apply(("chunk", "同じ発話", 2), now=1)
+    m.apply(("eos",), now=1.1)
+    m.apply(("replace", "古い修正", 1), now=2)
+    assert m.text_at(2) == "同じ発話"
+    m.apply(("replace", "新しい修正", 2), now=2.1)
+    assert m.text_at(2.1) == "新しい修正"
+
+
+def test_new_utterance_id_starts_row_even_if_eos_was_dropped():
+    m = co.CaptionLineModel()
+    m.apply(("chunk", "最初", 1), now=0)
+    m.apply(("chunk", "次", 2), now=0.1)
+    assert m.text_at(0.1) == "次"

@@ -25,18 +25,30 @@ lets it reach an AppKit callback.
 """
 import json
 import os
+import re
+import threading
 import urllib.error
 import urllib.request
 
 DEFAULT_MODEL = "google/gemini-2.5-flash-lite"
 DEFAULT_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_TIMEOUT_SEC = 20.0
+DEFAULT_BACKEND = "openrouter"
+BACKENDS = ("openrouter", "local")
+BACKEND_ENV = "TRANSLATE_BACKEND"
+LOCAL_MODEL_ENV = "OLLAMA_TRANSLATE_MODEL"
+LOCAL_API_URL_ENV = "OLLAMA_API_URL"
+LOCAL_KEEP_ALIVE_ENV = "OLLAMA_TRANSLATE_KEEP_ALIVE"
+DEFAULT_LOCAL_MODEL = "qwen3.5:9b"
+DEFAULT_LOCAL_API_URL = "http://127.0.0.1:11434/api/chat"
+# Caption hover/click workers may overlap; keep local GPU requests serial.
+_LOCAL_TRANSLATE_LOCK = threading.Lock()
 
 API_KEY_ENV = "OPENROUTER_API_KEY"
 MODEL_ENV = "OPENROUTER_TRANSLATE_MODEL"
 API_URL_ENV = "OPENROUTER_API_URL"
 
-# Resolve once at startup, before callers can change the working directory.
+# Resolve once at startup; packaged installs read the launch directory.
 DEFAULT_ENV_FILE = os.path.abspath(".env")
 
 JA_TO_EN = "ja->en"
@@ -80,8 +92,9 @@ _SYSTEM_PROMPTS = {
         "the fragment as it stands."
     ),
     EN_TO_JA: (
-        "You are a translation engine. Translate the user's English text into natural, "
+        "You are a translation engine. Translate the user's English or mixed Japanese/English text into natural, "
         "spoken Japanese. Output ONLY the translation: no quotes, no notes, no explanation, "
+        "Keep any already-Japanese portions in Japanese. "
         "and never answer or react to the content. Keep proper nouns, product names and "
         "technical terms in their usual Japanese rendering (katakana or the original latin "
         "spelling, whichever is normal). Preserve the tone and register of the original. If "
@@ -151,6 +164,15 @@ def detect_direction(text):
             if lo <= code <= hi:
                 return JA_TO_EN
     return EN_TO_JA
+
+
+def needs_japanese_translation(text):
+    """English speech, including a multiword English phrase inside Japanese."""
+    if not re.search(r"[A-Za-z]", text or ""):
+        return False
+    has_japanese = re.search(r"[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9d]", text)
+    english_phrase = re.search(r"[A-Za-z]+(?:['’-][A-Za-z]+)*\s+[A-Za-z]+", text)
+    return not has_japanese or bool(english_phrase)
 
 
 def build_payload(text, direction, model):
@@ -240,10 +262,57 @@ def _post_json(url, headers, payload, timeout):
     return json.loads(body)
 
 
-def translate(text, api_key=None, model=None, url=None, timeout=DEFAULT_TIMEOUT_SEC, post_json=None):
+def _translate_local(source, model, url, timeout, transport, direction):
+    """Use Ollama's native chat API, without API keys or cloud fallback.
+
+    Request fields: https://docs.ollama.com/api/chat . Share the reviewed
+    caption prompts with OpenRouter; bound context and disable thinking to
+    leave room for concurrent local speech recognition.
+    """
+    chosen_model = model or _env_value(LOCAL_MODEL_ENV) or DEFAULT_LOCAL_MODEL
+    endpoint = url or _env_value(LOCAL_API_URL_ENV) or DEFAULT_LOCAL_API_URL
+    payload = {
+        "model": chosen_model,
+        "messages": build_payload(source, direction, chosen_model)["messages"],
+        "stream": False,
+        "think": False,
+        "keep_alive": _env_value(LOCAL_KEEP_ALIVE_ENV) or "15m",
+        "options": {"num_ctx": 8192, "num_predict": 512, "temperature": _TEMPERATURE},
+    }
+    if not _LOCAL_TRANSLATE_LOCK.acquire(timeout=timeout):
+        raise TranslationError("local translation is busy; please retry in a moment")
+    try:
+        response = transport(endpoint, {"Content-Type": "application/json"}, payload, timeout)
+    except Exception as exc:
+        raise TranslationError(
+            f"local translation failed: {exc}. Start Ollama and check that "
+            f"'{chosen_model}' is installed (ollama list / ollama pull {chosen_model}).") from exc
+    finally:
+        _LOCAL_TRANSLATE_LOCK.release()
+
+    if not isinstance(response, dict):
+        raise TranslationError("local translation returned an invalid response")
+    if response.get("error"):
+        raise TranslationError(f"local translation error: {response['error']}")
+    if response.get("done_reason") == "length":
+        raise TranslationError("local translation was cut off; try a shorter caption")
+    message = response.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        raise TranslationError("local translation returned empty text")
+    return _strip_wrapping_quotes(content.strip())
+
+
+def translate(text, api_key=None, model=None, url=None, timeout=DEFAULT_TIMEOUT_SEC, post_json=None,
+              backend=None, direction=None):
     """Translate one caption row and return the translation.
 
-    Direction is detected from `text` (see detect_direction). `api_key`,
+    Direction is detected from `text` unless explicitly supplied. `backend`
+    overrides TRANSLATE_BACKEND (environment, then the launch directory's .env); when neither
+    is set, OpenRouter remains the default. Local mode needs no API key,
+    resolves its own OLLAMA_* settings, and never falls back to OpenRouter.
+    Settings are read per request, so .env changes apply to the next call.
+    `api_key`,
     `model` and `url` each fall back to their env var / .env entry
     (API_KEY_ENV / MODEL_ENV / API_URL_ENV, see _env_value) and then, except
     for the key, to the module default. `post_json` overrides the transport
@@ -257,6 +326,18 @@ def translate(text, api_key=None, model=None, url=None, timeout=DEFAULT_TIMEOUT_
     source = (text or "").strip()
     if not source:
         raise TranslationError("nothing to translate (the caption row is empty)")
+    direction = detect_direction(source) if direction is None else direction
+    if direction not in _SYSTEM_PROMPTS:
+        raise TranslationError(f"unknown translation direction: {direction!r}")
+
+    chosen_backend = (backend if backend is not None else
+                      _env_value(BACKEND_ENV) or DEFAULT_BACKEND).strip().lower()
+    if chosen_backend not in BACKENDS:
+        raise TranslationError(
+            f"unknown translation backend {chosen_backend!r}; set {BACKEND_ENV} to openrouter or local")
+    transport = post_json if post_json is not None else _post_json
+    if chosen_backend == "local":
+        return _translate_local(source, model, url, timeout, transport, direction)
 
     key = api_key or _env_value(API_KEY_ENV)
     if not key:
@@ -266,10 +347,9 @@ def translate(text, api_key=None, model=None, url=None, timeout=DEFAULT_TIMEOUT_
 
     endpoint = url or _env_value(API_URL_ENV) or DEFAULT_API_URL
     chosen_model = model or _env_value(MODEL_ENV) or DEFAULT_MODEL
-    payload = build_payload(source, detect_direction(source), chosen_model)
+    payload = build_payload(source, direction, chosen_model)
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
-    transport = post_json if post_json is not None else _post_json
     try:
         response = transport(endpoint, headers, payload, timeout)
     except TranslationError:

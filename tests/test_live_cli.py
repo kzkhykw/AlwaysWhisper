@@ -83,6 +83,11 @@ def test_live_wires_audio_meter_and_always_stops_worker(monkeypatch, tmp_path, f
             events.append("fed")
         def get_audio_level(self):
             return (123, .5)
+        def set_language(self, language):
+            events.append(("language", language))
+            return True
+        def get_language(self):
+            return "auto"
         def stop(self):
             events.append("stopped")
             return {"jsonl_path": "session.jsonl"}
@@ -100,6 +105,10 @@ def test_live_wires_audio_meter_and_always_stops_worker(monkeypatch, tmp_path, f
         assert display_queue is queue
         assert kwargs["level_source"]() == (123, .5)
         assert kwargs["position"] == "free"
+        assert kwargs["language"] == "auto"
+        assert kwargs["language_source"]() == "auto"
+        assert kwargs["language_change"]("ja-en")
+        assert ("language", "ja-en") in events
         raise KeyboardInterrupt
     monkeypatch.setattr(cli, "sys", SimpleNamespace(platform="darwin"))
     monkeypatch.setattr(cli, "platform", SimpleNamespace(machine=lambda: "arm64"))

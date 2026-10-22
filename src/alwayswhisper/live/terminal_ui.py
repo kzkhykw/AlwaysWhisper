@@ -23,7 +23,8 @@ MESSAGES = {
     "language_change": ("  Switch to Japanese: {command} --ui-language ja (remembered)", "  英語表示に変更: {command} --ui-language en（記憶します）"),
     "title": ("\nAlwaysWhisper — live transcription", "\nAlwaysWhisper — ライブ文字起こし"),
     "microphone": ("  Microphone: {name}", "  マイク: {name}"),
-    "recognition_language": ("  Recognition language: {language} (independent of display language)", "  認識言語: {language}（表示言語とは別の設定です）"),
+    "recognition_language": ("  Speech recognition: {language}", "  音声認識: {language}"),
+    "caption_output": ("  Caption output: {output}", "  字幕出力: {output}"),
     "save_folder": ("  Save folder: {path}", "  保存先: {path}"),
     "read_later": ("  Read later: YYYY-MM-DD.md (daily notes); live_*.jsonl (session data)", "  読み返す: YYYY-MM-DD.md（日別ノート） / live_*.jsonl（セッションデータ）"),
     "open_folder": ("  Open folder: open {path}", "  Finderで開く: open {path}"),
@@ -58,13 +59,34 @@ def message(ui_language, key, **values):
 def print_session_guide(language, *, directory, command, recognition_language,
                         prompt=None, prompt_file=None, bundled_prompt=False,
                         glossary_option="--glossary", inline_option=None,
-                        microphone=None, model=None):
+                        microphone=None, model=None, async_caption_translation=False):
     def say(key, **values):
         print(message(language, key, **values))
     say("title")
     if microphone is not None:
         say("microphone", name=microphone)
-    say("recognition_language", language=recognition_language)
+    if recognition_language in (None, "auto"):
+        recognition = ("Japanese/English auto-detection", "日本語・英語の自動判定")
+    elif recognition_language in ("ja", "ja-en"):
+        recognition = ("Japanese fixed", "日本語に固定")
+    elif recognition_language in ("en", "en-ja"):
+        recognition = ("English fixed", "英語に固定")
+    else:
+        recognition = (str(recognition_language),) * 2
+    if recognition_language == "en-ja":
+        output = (("English first, then local Japanese translation",
+                   "英語を先に表示→ローカル翻訳後に日本語へ置換")
+                  if async_caption_translation else
+                  ("English translated to Japanese", "英語を日本語に翻訳"))
+    elif recognition_language == "ja-en":
+        output = (("Japanese first, then local English translation", "日本語を先に表示→ローカル翻訳後に英語へ置換")
+                  if async_caption_translation else
+                  ("Japanese translated to English", "日本語を英語に翻訳"))
+    else:
+        output = ("Original spoken language", "発話した言語のまま")
+    idx = 1 if language == "ja" else 0
+    say("recognition_language", language=recognition[idx])
+    say("caption_output", output=output[idx])
     say("save_folder", path=directory)
     say("read_later")
     say("open_folder", path=shlex.quote(str(directory)))

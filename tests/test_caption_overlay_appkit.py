@@ -138,7 +138,10 @@ def checked(fn):
 
 def resize_down():
     f = p.frame()
-    post(AppKit.NSEventTypeLeftMouseDown, c.renderer.control_frame[2] - 14, f.size.height - 14)
+    x, y = c.renderer.control_frame[2] - 14, f.size.height - 14
+    c._mouse_location = lambda: (f.origin.x + x, f.origin.y + y)
+    c.tick()  # expose the hover-only handle before synthesizing its click
+    post(AppKit.NSEventTypeLeftMouseDown, x, y)
 
 
 def resize_drag():
@@ -176,7 +179,9 @@ def run_step(index):
 def start_checks():
     checked(check_hover_and_caption_lifecycle)
     if not failures:
-        run_step(0)
+        # The lifecycle check repeatedly orders the native window out/in.
+        # Let WindowServer finish its show animation before posting clicks.
+        AppHelper.callLater(.4, lambda: run_step(0))
 AppHelper.callLater(.05, start_checks)
 AppHelper.callLater(7, AppHelper.stopEventLoop)
 try:
@@ -212,7 +217,19 @@ import AppKit
 from alwayswhisper.live import caption_overlay as co
 AppKit.NSApplication.sharedApplication().setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
 q = queue.Queue()
-c = co._OverlayController(q, settings_path=None, position=sys.argv[2])
+class FakeLiveInput:
+    active = False
+    error = None
+    def toggle(self):
+        self.active = not self.active
+        return self.active
+    def feed(self, *args, **kwargs):
+        pass
+    def flush(self):
+        pass
+mode = FakeLiveInput()
+c = co._OverlayController(q, settings_path=None, position=sys.argv[2],
+                          live_input_session=mode)
 c._mouse_location = lambda: (-99999, -99999)
 
 def pump(seconds):
@@ -239,6 +256,11 @@ try:
     anchor = surface.anchor
     compact = frame()
     assert abs(compact[1] + compact[3] - anchor.top) < 1
+    assert surface.live_input_control.toolTip() == "直接入力：オフ（クリックでオン）"
+    assert surface.live_input_control.isHidden()
+    assert c.renderer.live_input_frame is None
+    pencil = co._island_live_input_rect(frame(), anchor)
+    assert pencil[0] + pencil[2] <= anchor.center_x - anchor.camera_width / 2
     capture("compact")
     q.put(("chunk", "字幕をこの島の中に表示します"))
     c.tick(now=1)
@@ -270,7 +292,7 @@ try:
     assert abs((anchor.top - anchor.header_height - label_top) * anchor.scale - 2) < .01
     assert abs((label_bottom - expanded[1]) * anchor.scale - 4) < .01
     capture("expanded")
-    # Native mouse events resize the expanded body while it stays centered.
+    # Post native mouse events at the left border. Its center stays on the camera.
     def post(kind, x, y):
         event = AppKit.NSEvent.mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure_(
             kind, AppKit.NSMakePoint(x, y), 0, time.monotonic(), c.renderer.panel.windowNumber(),
@@ -287,7 +309,53 @@ try:
     assert resized[2] == expanded[2] + 60
     assert resized[0] + resized[2] / 2 == expanded[0] + expanded[2] / 2
     assert c.geometry.island_width == expanded[2] + 60
-    capture("resized")
+    for i in range(6):
+        q.put(("eos",))
+        q.put(("chunk", f"履歴 {i}"))
+    c.tick(now=1.1)
+    c._mouse_location = lambda: (frame()[0] + frame()[2] / 2, frame()[1] + 5)
+    c.tick(now=1.15)
+    before_height = frame()
+    c._mouse_location = lambda: (before_height[0] + before_height[2] / 2, before_height[1] + 5)
+    c.tick(now=1.17)
+    post(AppKit.NSEventTypeLeftMouseDown, before_height[2] / 2, 5)
+    pump(.05)
+    assert c._height_resize_base is not None
+    post(AppKit.NSEventTypeLeftMouseDragged, before_height[2] / 2, -130)
+    pump(.05)
+    post(AppKit.NSEventTypeLeftMouseUp, before_height[2] / 2, -130)
+    pump(.05)
+    resized = frame()
+    assert resized[3] == before_height[3] + 135
+    assert resized[1] + resized[3] == anchor.top
+    assert sum(resized[1] <= box.frame[1]
+               and box.frame[1] + box.frame[3] <= anchor.top - anchor.header_height
+               for box in c._row_boxes) > 3
+    live_box = c._row_boxes[-1]
+    c._mouse_location = lambda: (resized[0] + 30,
+                                 live_box.frame[1] + live_box.frame[3] / 2)
+    c.tick(now=1.2)
+    pencil = c.renderer.live_input_frame
+    post(AppKit.NSEventTypeLeftMouseDown,
+         pencil[0] - resized[0] + pencil[2] / 2,
+         pencil[1] - resized[1] + pencil[3] / 2)
+    pump(.05)
+    assert mode.active
+    c.tick(now=1.5)
+    assert surface.live_input_control.toolTip() == "直接入力：オン（クリックでオフ）"
+    indicator = surface.live_input_control
+    assert indicator.dot_count == 1
+    capture("direct-input-on")
+    # The existing tick animates just the dots, without rebuilding captions.
+    body = surface.body_views[0][0]
+    stable_frame = frame()
+    for now, count in [(1.91, 2), (2.31, 3), (2.71, 1)]:
+        c.tick(now=now)
+        assert surface.live_input_control is indicator
+        assert indicator.dot_count == count
+        assert surface.body_views[0][0] is body and frame() == stable_frame
+    assert c.renderer.control_frame is not None
+    c._mouse_location = lambda: (-99999, -99999)
     # Hovering changes only the actions: neither the centered text rectangle
     # nor the wrapping/row geometry may move, including when history is shown.
     def text_frames():
@@ -319,7 +387,8 @@ try:
             assert text_rect[0] + text_rect[2] <= box.icon[0]
             # Visual icons and their screen-coordinate click targets agree.
             chip = surface.body_views[hovered][0]
-            for view, hit in zip(list(chip.subviews())[1:], [box.icon, box.translate_icon]):
+            for view, hit in zip(list(chip.subviews())[1:],
+                                 [box.icon, box.translate_icon]):
                 vf, cf = view.frame(), chip.frame()
                 icon_center = (frame()[0] + cf.origin.x + vf.origin.x + vf.size.width / 2,
                                frame()[1] + cf.origin.y + vf.origin.y + vf.size.height / 2)
@@ -331,22 +400,99 @@ try:
     pump(.3)
     assert frame() == compact
     assert c.renderer.panel.isVisible()
+    assert mode.active
+    assert surface.live_input_control.isHidden() and c.renderer.live_input_frame is None
+    # Hover reveals the button and expands the last caption.
+    c._mouse_location = lambda: (compact[0] + 20, compact[1] + compact[3] / 2)
+    c.tick(now=7.05)
+    pump(.3)
+    c.tick(now=7.06)
+    assert not surface.live_input_control.isHidden()
+    hovered = frame()
+    pencil = c.renderer.live_input_frame
+    post(AppKit.NSEventTypeLeftMouseDown,
+         pencil[0] - hovered[0] + pencil[2] / 2,
+         pencil[1] - hovered[1] + pencil[3] / 2)
+    pump(.05)
+    assert not mode.active and not c._pinned
+    c.tick(now=7.1)
+    assert not hasattr(surface.live_input_control, "dot_count")
+    assert surface.live_input_control.toolTip() == "直接入力：オフ（クリックでオン）"
+    post(AppKit.NSEventTypeLeftMouseDown,
+         pencil[0] - hovered[0] + pencil[2] / 2,
+         pencil[1] - hovered[1] + pencil[3] / 2)
+    pump(.05)
+    assert mode.active
     # Hover the accessible wing: expands the last caption from the compact shell.
     c._mouse_location = lambda: (compact[0] + 20, compact[1] + compact[3] / 2)
     c.tick(now=8)
     assert not surface.compact
     pump(.3)
-    assert c._row_boxes[-1].text == "字幕をこの島の中に表示します"
+    assert c._row_boxes[-1].text == "履歴 5"
     c._dismiss()
     pump(.3)
     assert surface.compact and c.renderer.panel.isVisible()
+    assert mode.active
+    assert surface.live_input_control.toolTip() == "直接入力：オン（クリックでオフ）"
     # Incoming speech interrupts collapse/expansion safely.
+    requested = []
+    c._language = "ja"
+    c._language_change = lambda language: requested.append(language) or True
+    c.show_from_menu()
+    pump(.3)
+    assert c.renderer.panel.isKeyWindow()
+    def press_language(repeat=False):
+        # Model selecting the island before each shortcut; another live
+        # caption app may also be running on this desktop during opt-in tests.
+        c.renderer.panel.makeKeyAndOrderFront_(None)
+        event = AppKit.NSEvent.keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode_(
+            AppKit.NSEventTypeKeyDown, AppKit.NSMakePoint(0, 0), 0, time.monotonic(),
+            c.renderer.panel.windowNumber(), None, "i", "i", repeat, 34)
+        AppKit.NSApplication.sharedApplication().postEvent_atStart_(event, False)
+        pump(.05)
+    press_language(True)
+    assert requested == []
+    press_language()
+    assert requested == ["en"]
+    c.tick(now=8.2)
+    assert surface.language_view.stringValue() == "…"
+    q.put(("language", "en"))
+    c.tick(now=8.3)
+    assert surface.language_view.stringValue() == "EN"
+    capture("language-en")
+    assert c.renderer.panel.isKeyWindow(), "language repaint lost island focus"
+    for language, label_text in [("en-ja", "EN→JA"), ("ja-en", "JA→EN"), ("ja", "JA")]:
+        press_language()
+        assert requested[-1] == language
+        q.put(("language", language))
+        c.tick(now=8.4)
+        assert surface.language_view.stringValue() == label_text
+        assert not surface.language_view.isHidden() and not surface.live_input_control.isHidden()
+        label = surface.language_view.frame()
+        assert surface.language_view.cell().cellSize().width <= label.size.width
+        assert frame()[0] + label.origin.x + label.size.width <= anchor.center_x - anchor.camera_width / 2
+        capture("language-" + language)
+    assert requested == ["en", "en-ja", "ja-en", "ja"]
+    stable = frame(), text_frames()
+    c._mouse_location = lambda: (-99999, -99999)
+    c.tick(now=8.5)
+    assert surface.language_view.isHidden() and surface.live_input_control.isHidden()
+    assert c.renderer.live_input_frame is None
+    assert (frame(), text_frames()) == stable
+    capture("header-hidden")
+    c._dismiss()
+    pump(.3)
+    # Hidden controls reserve enough space when compact, too.
+    label = surface.language_view.frame()
+    assert frame()[0] + label.origin.x + label.size.width <= anchor.center_x - anchor.camera_width / 2
+    capture("language-ja-compact")
     c._mouse_location = lambda: (-99999, -99999)
     q.put(("chunk", "次の字幕"))
     c.tick(now=9)
     c._dismiss()
     assert surface.compact
     c.close()  # closes even mid-animation
+    assert not mode.active
     assert surface.timer is None
     assert not c.renderer.panel.isVisible()
     print("NATIVE_ISLAND_MORPH_OK", anchor)

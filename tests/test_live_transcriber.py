@@ -2825,3 +2825,201 @@ def test_no_meter_work_without_captions(tmp_path):
     t = lt.LiveTranscriber(16000, "fake", "ja", str(tmp_path))
     t.feed(np.ones(256, dtype=np.float32))
     assert t.get_audio_level() is None
+
+
+def test_japanese_display_translates_english_and_mixed_text(monkeypatch):
+    calls = []
+
+    def translate(text, **kwargs):
+        calls.append((text, kwargs))
+        return "会議を始めましょう。"
+
+    monkeypatch.setattr(lt.translator, "translate", translate)
+    for text in ("Let's start the meeting.", "では let's start the meeting.", "Hello。"):
+        assert lt._translated_display_text(text, "en-ja", "local") == "会議を始めましょう。"
+    assert all(kwargs == {"backend": "local", "direction": lt.translator.EN_TO_JA}
+               for _, kwargs in calls)
+
+
+
+def test_japanese_display_skips_japanese_names_numbers_and_other_modes(monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("translation should not be called")
+
+    monkeypatch.setattr(lt.translator, "translate", unexpected)
+    for text in ("会議を始めましょう。", "Notionを開きます", "APIとAI。", "12345"):
+        assert lt._translated_display_text(text, "en-ja") == text
+    for language in ("ja", "en", "auto", None):
+        assert lt._translated_display_text("Let's start the meeting.", language) == "Let's start the meeting."
+
+
+
+def test_japanese_display_translation_failure_retains_source(monkeypatch, capsys):
+    def fail(*args, **kwargs):
+        raise lt.translator.TranslationError("offline")
+
+    monkeypatch.setattr(lt.translator, "translate", fail)
+    assert lt._translated_display_text("Let's start the meeting.", "en-ja") == "Let's start the meeting."
+    assert "原文を表示" in capsys.readouterr().err
+
+
+
+@pytest.mark.parametrize("language,source,output,direction", [
+    ("en-ja", "Let's start the meeting.", "会議を始めましょう。", lt.translator.EN_TO_JA),
+    ("ja-en", "会議を始めましょう。", "Let's start the meeting.", lt.translator.JA_TO_EN),
+])
+def test_worker_translation_keeps_source_and_emits_output_language(tmp_path, monkeypatch, language, source, output, direction):
+    result = {"text": source, "segments": [{
+        "text": source, "no_speech_prob": 0.05, "avg_logprob": -0.2,
+        "compression_ratio": 1.1,
+        "words": [{"word": source, "start": 0.0, "end": 0.7}],
+    }]}
+    monkeypatch.setattr(lt, "_make_transcribe_fn", lambda cfg: (lambda audio: result, "whisper"))
+    calls = []
+
+    def translate(text, **kwargs):
+        calls.append((text, kwargs))
+        return output
+
+    monkeypatch.setattr(lt.translator, "translate", translate)
+    cfg, jsonl_path, md_path = _worker_cfg(tmp_path)
+    cfg.update(language=language, display_mode="word", translate_backend="local")
+    q = queue.Queue()
+    q.put(_tone(16000, 16000))
+    q.put(None)
+    display_q = _FakeDisplayQueue()
+    lt._worker(q, cfg, display_q)
+    assert display_q.events == [("chunk", output), ("eos",)]
+    assert calls == [(source, {"backend": "local", "direction": direction})]
+    assert source in md_path.read_text()
+    assert json.loads(jsonl_path.read_text().splitlines()[1])["text"] == source
+
+
+
+def test_worker_async_caption_translation_emits_source_without_calling_llm(tmp_path, monkeypatch):
+    source = "Let's start the meeting."
+    result = {"text": source, "segments": [{
+        "text": source, "no_speech_prob": 0.05, "avg_logprob": -0.2,
+        "compression_ratio": 1.1,
+    }]}
+    monkeypatch.setattr(lt, "_make_transcribe_fn", lambda cfg: (lambda audio: result, "whisper"))
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("translation must run in the overlay, not the ASR worker")
+
+    monkeypatch.setattr(lt.translator, "translate", unexpected)
+    cfg, jsonl_path, _ = _worker_cfg(tmp_path)
+    cfg.update(language="en-ja", async_caption_translation=True, display_mode="word")
+    q = queue.Queue()
+    q.put(_tone(16000, 16000))
+    q.put(None)
+    display_q = _FakeDisplayQueue()
+    lt._worker(q, cfg, display_q)
+    assert display_q.events == [("chunk", source, 1), ("eos",)]
+    assert json.loads(jsonl_path.read_text().splitlines()[1])["text"] == source
+
+
+
+def test_worker_does_not_translate_filtered_hallucination(tmp_path, monkeypatch):
+    result = {"text": "Thank you for watching"}
+    monkeypatch.setattr(lt, "_make_transcribe_fn", lambda cfg: (lambda audio: result, "whisper"))
+
+    calls = []
+
+    def unexpected(*args, **kwargs):
+        calls.append(args)
+        return "幻聴を翻訳してはいけない"
+
+    monkeypatch.setattr(lt.translator, "translate", unexpected)
+    cfg, _, _ = _worker_cfg(tmp_path)
+    cfg["language"] = "en-ja"
+    q = queue.Queue()
+    q.put(_tone(16000, 16000))
+    q.put(None)
+    display_q = _FakeDisplayQueue()
+    lt._worker(q, cfg, display_q)
+    assert display_q.events == []
+    assert calls == []
+
+
+
+def test_language_switch_preserves_audio_order_and_reuses_decoder(tmp_path, monkeypatch):
+    calls, loaded = [], []
+    def recognize(audio, **options):
+        calls.append(options["language"])
+        return {"text": "こんにちは" if options["language"] == "ja" else "Hello there."}
+    monkeypatch.setitem(sys.modules, "mlx_whisper", types.SimpleNamespace(transcribe=recognize))
+    make_decoder = lt._make_transcribe_fn
+    def make_once(cfg):
+        loaded.append(True)
+        return make_decoder(cfg)
+    monkeypatch.setattr(lt, "_make_transcribe_fn", make_once)
+    cfg, jsonl_path, _ = _worker_cfg(tmp_path)
+    cfg.update(language="ja", display_mode="sentence", async_caption_translation=True)
+    q, display = queue.Queue(), _FakeDisplayQueue()
+    for language in ("en", "en-ja", "ja-en", "ja"):
+        q.put(_tone(16000, 16000))  # ongoing speech: marker flushes it under the old mode
+        q.put(("set_language", language))
+    q.put(_tone(16000, 16000))
+    q.put(None)
+    state = types.SimpleNamespace(value=0)
+    lt._worker(q, cfg, display, state)
+    assert loaded == [True]
+    assert calls == ["ja", "en", "en", "ja", "ja"]
+    assert state.value == 1
+    assert cfg["async_caption_translation"] is False
+    records = [json.loads(line) for line in jsonl_path.read_text().splitlines()][1:]
+    assert [r["text"] for r in records] == ["こんにちは", "Hello there.", "Hello there.", "こんにちは", "こんにちは"]
+    assert [(r["start"], r["end"]) for r in records] == [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
+    assert [r.get("language", "ja") for r in records] == ["ja", "en", "en-ja", "ja-en", "ja"]
+    assert [(e[0], e[1]) for e in display.events if e[0] != "eos"] == [
+        ("chunk", "こんにちは"), ("language", "en"), ("chunk", "Hello there."),
+        ("language", "en-ja"), ("chunk", "Hello there."),
+        ("language", "ja-en"), ("chunk", "こんにちは"),
+        ("language", "ja"), ("chunk", "こんにちは")]
+
+
+
+def test_qwen_language_changes_do_not_reload_model(monkeypatch):
+    models = []
+    monkeypatch.setitem(sys.modules, "qwen3_asr_mlx", _fake_qwen_module(models=models))
+    cfg = {"model": "fake", "engine": "qwen", "language": "ja"}
+    decode, _ = lt._make_transcribe_fn(cfg)
+    for language in ("ja", "en", "en-ja", "ja-en", "ja"):
+        cfg["language"] = language
+        decode(np.zeros(16000, dtype=np.float32))
+    assert len(models) == 1
+    assert [call["language"] for call in models[0].calls] == ["ja", "en", "en", "ja", "ja"]
+
+
+
+@pytest.mark.parametrize("language,code", [("ja", 1), ("en", 2), ("en-ja", 3), ("ja-en", 4)])
+def test_language_state_survives_dropped_caption_ack(tmp_path, monkeypatch, language, code):
+    monkeypatch.setitem(sys.modules, "mlx_whisper", _FakeMlxWhisper())
+    cfg, _, _ = _worker_cfg(tmp_path)
+    q = queue.Queue()
+    q.put(("set_language", language))
+    q.put(None)
+    state = types.SimpleNamespace(value=0)
+    lt._worker(q, cfg, _FakeDisplayQueue(full=True), state)
+    assert state.value == code
+
+
+
+def test_parent_language_request_keeps_process_and_reports_only_applied_mode(tmp_path):
+    t = lt.LiveTranscriber(16000, "fake", "en", str(tmp_path), async_caption_translation=True)
+    assert not t.cfg["async_caption_translation"]
+    assert t.cfg["async_caption_translation_enabled"]
+    process = types.SimpleNamespace(is_alive=lambda: True)
+    t._proc = process
+    t._queue = queue.Queue(maxsize=1)
+    t._language_state = types.SimpleNamespace(value=0)
+    assert t.set_language("ja")
+    assert t.get_language() == "en" and t._proc is process
+    with pytest.raises(RuntimeError, match="いっぱい"):
+        t.set_language("en")
+    assert t._queue.get_nowait() == ("set_language", "ja")
+    t._language_state.value = 1
+    assert t.get_language() == "ja"
+    with pytest.raises(ValueError):
+        t.set_language("invalid")
