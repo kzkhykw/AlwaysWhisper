@@ -2747,6 +2747,7 @@ def test_handle_mouse_drag_completes_without_unboundlocalerror_and_calls_move_to
     renderer = _FakeRendererWithPanel(panel)
     controller = co._OverlayController(_FakeDisplayQueue([]), font_size=28, renderer=renderer, settings_path=None)
     controller._drag_base = (100.0, 50.0, 0.5, 24.0)   # base_x, base_y, base_cx, base_bottom
+    controller._mouse_location = lambda: (150.0, 80.0)
 
     monkeypatch.setitem(sys.modules, "AppKit", _FakeAppKitModuleForDrag(mouse_x=150.0, mouse_y=80.0))
     move_to_calls = []
