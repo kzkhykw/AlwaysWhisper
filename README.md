@@ -1097,6 +1097,39 @@ alwayswhisper live --device 3 --language en
 alwayswhisper live --demo                     # no microphone/model; meter stays idle
 ```
 
+### Capture meeting audio with headphones
+
+Choose the microphone, computer playback, or both. The default remains microphone-only.
+
+```bash
+alwayswhisper live --audio-source both    # your microphone + other participants
+alwayswhisper live --audio-source system  # playback only; never opens the microphone
+alwayswhisper live --audio-source mic     # microphone only (default)
+
+# Optional: restrict playback capture to a running app
+alwayswhisper live --audio-source both --system-audio-app us.zoom.xos
+alwayswhisper live --audio-source both --system-audio-app com.google.Chrome
+```
+
+System capture uses macOS 13+ ScreenCaptureKit and leaves the current headphone/output
+device unchanged. No virtual audio driver is needed. First use requires Screen & System
+Audio Recording permission in **System Settings → Privacy & Security** for the app macOS
+identifies (for example, your terminal). Grant permission and restart the command.
+The first run also needs Xcode Command Line Tools (`xcrun swiftc`) to build the bundled
+Swift helper; the executable is cached in `~/Library/Caches/AlwaysWhisper/`.
+
+Without `--system-audio-app`, playback from all apps is captured. Repeat the option for
+multiple bundle IDs. Start the selected apps first; an unavailable app or denied permission
+stops capture instead of silently falling back to another source. A browser filter includes
+its other tabs, not just Meet. This does not join a meeting or identify individual speakers.
+
+System audio and the optional microphone share a 48 kHz timeline with a 150 ms buffer,
+then feed the existing local ASR, captions, and Live Input. `--sample-rate` must be omitted
+or set to `48000` in these modes. Use headphones with `both` so the microphone does not
+pick up the speakers a second time. No raw audio recording is saved by this feature;
+existing transcript, translation, and network settings still apply. Recording stops when
+the command exits, and Ctrl-C flushes the remaining buffered audio before ASR finalizes.
+
 `notch` is also accepted as an alias for the island. The notched screen is
 preferred when an external display is attached; without a notch the island
 sits below the menu bar. Hover to read recent history, scroll to browse older

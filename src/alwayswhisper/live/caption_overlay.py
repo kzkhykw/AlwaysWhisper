@@ -3648,7 +3648,7 @@ def _run_interactive_event_loop(app_helper):
 def run_console_overlay(display_queue, font_size=_DEFAULT_FONT_SIZE, settings_path=DEFAULT_SETTINGS_PATH,
                         position=None, level_source=None, translate_backend=None,
                         auto_translate=False, language=None, language_change=None,
-                        language_source=None):
+                        language_source=None, health_check=None):
     """For a caller with no event loop of its own (live_avatar.cmd_transcribe
     / --transcribe-only): build the panel, drive it from a private NSTimer,
     and block the calling (main) thread in AppKit's console run loop until
@@ -3691,14 +3691,32 @@ def run_console_overlay(display_queue, font_size=_DEFAULT_FONT_SIZE, settings_pa
                                             level_source=level_source, translate_backend=translate_backend,
                                             auto_translate=auto_translate, language=language,
                                             language_change=language_change, language_source=language_source)
+    failure = []
+
+    def tick(_timer):
+        if failure:
+            return
+        # Do not leave an apparently active overlay behind if its audio source
+        # has died. Stop the console loop, then raise on the Python caller's
+        # stack so input and transcription receive their normal cleanup.
+        if health_check is not None:
+            try:
+                health_check()
+            except Exception as exc:
+                failure.append(exc)
+                AppHelper.stopEventLoop()
+                return
+        controller.tick()
+
     timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
-        _POLL_INTERVAL_SEC, True, lambda _t: controller.tick()
-    )
+        _POLL_INTERVAL_SEC, True, tick)
     try:
         _run_interactive_event_loop(AppHelper)
     finally:
         timer.invalidate()
         controller.close()
+    if failure:
+        raise failure[0]
     raise KeyboardInterrupt
 
 
