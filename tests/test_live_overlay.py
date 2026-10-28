@@ -4197,3 +4197,25 @@ def test_fn_shortcut_install_and_cleanup_belong_to_controller(monkeypatch):
     assert callbacks == [c._toggle_live_input_from_fn]
     c.close()
     assert calls == ["start", "close"]
+
+
+def test_console_overlay_propagates_audio_failure_and_closes_panel(monkeypatch):
+    from types import SimpleNamespace
+    calls, callbacks = [], []
+    timer = SimpleNamespace(invalidate=lambda: calls.append("invalidate"))
+    app = SimpleNamespace(setActivationPolicy_=lambda _policy: None)
+    appkit = SimpleNamespace(
+        NSApplication=SimpleNamespace(sharedApplication=lambda: app),
+        NSApplicationActivationPolicyAccessory=1,
+        NSTimer=SimpleNamespace(scheduledTimerWithTimeInterval_repeats_block_=
+            lambda _delay, _repeat, callback: callbacks.append(callback) or timer))
+    helper = SimpleNamespace(stopEventLoop=lambda: calls.append("stop loop"))
+    controller = SimpleNamespace(tick=lambda: calls.append("tick"), close=lambda: calls.append("close"))
+    monkeypatch.setattr(co, "_require_appkit", lambda: (appkit, helper))
+    monkeypatch.setattr(co, "attach_timer_based_overlay", lambda *args, **kw: controller)
+    monkeypatch.setattr(co, "_run_interactive_event_loop", lambda _helper: callbacks[0](timer))
+    def failed():
+        raise RuntimeError("system audio stopped")
+    with pytest.raises(RuntimeError, match="system audio stopped"):
+        co.run_console_overlay(None, health_check=failed)
+    assert calls == ["stop loop", "invalidate", "close"]

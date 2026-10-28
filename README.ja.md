@@ -696,6 +696,36 @@ alwayswhisper live --device 3 --language ja
 alwayswhisper live --demo                     # マイク／モデル不要の表示確認
 ```
 
+### イヤホンでMeet・Zoomの相手の声も取り込む
+
+`--audio-source` で入力元を選べます。既定は従来どおりマイクのみです。
+
+```bash
+alwayswhisper live --audio-source both    # 自分のマイク＋相手の声（内部音声）
+alwayswhisper live --audio-source system  # 内部音声のみ。マイクを開かない
+alwayswhisper live --audio-source mic     # マイクのみ（既定）
+
+# 対象アプリを限定する場合。先に対象アプリを起動する
+alwayswhisper live --audio-source both --system-audio-app us.zoom.xos
+alwayswhisper live --audio-source both --system-audio-app com.google.Chrome
+```
+
+macOS 13以降のScreenCaptureKitで内部音声を直接取得するため、イヤホンへの出力はそのままで、
+仮想オーディオドライバは不要です。初回はシステム設定 → プライバシーとセキュリティ →
+「画面収録とシステムオーディオ録音」でmacOSが示す対象（起動元のターミナル等）を許可し、
+コマンドを再起動してください。同梱Swiftヘルパーの初回ビルドにはXcode Command Line Tools
+（`xcrun swiftc`）が必要で、実行ファイルは `~/Library/Caches/AlwaysWhisper/` に保存します。
+
+アプリ指定がなければパソコン全体の再生音が対象です。バンドルIDは複数指定できます。
+対象アプリが未起動、権限が未許可などの場合はエラーで停止し、マイクだけへ自動的には切り替えません。
+ブラウザを指定するとMeet以外のタブの音も対象になります。会議への参加や話者の識別は行いません。
+
+マイクと内部音声は48kHzの同じ時間軸で合成し、約150msのバッファを通して既存の文字起こし・
+字幕・Live Inputへ渡します。`--sample-rate` は省略するか `48000` を指定してください。
+`both` ではスピーカー音をマイクでも拾わないよう、イヤホンを使用してください。
+追加の音声ファイルは保存せず、既存のトランスクリプト・翻訳・通信設定に従います。
+終了時には録音も停止し、Ctrl-Cでは残りの音声バッファを渡してから文字起こしを確定します。
+
 `notch` 指定もDynamic Islandと同じ表示です。ノッチ付き画面を優先し、ノッチがない
 場合はメニューバー下に表示します。ホバーで履歴を展開し、スクロールで過去の字幕を
 読み返せます。Command＋スクロールまたは右上のハンドルで文字サイズを変更できます。

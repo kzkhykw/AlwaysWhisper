@@ -1,4 +1,4 @@
-"""Microphone captions on Apple Silicon Macs; optional dependencies load at runtime."""
+"""Live audio captions on Apple Silicon Macs; optional dependencies load at runtime."""
 from __future__ import annotations
 
 import argparse
@@ -33,6 +33,10 @@ def configure_parser(parser):
     parser.add_argument("--font-size", type=int, choices=range(12, 97), metavar="12..96", default=28,
                         help="initial caption font size; saved size wins on later runs")
     parser.add_argument("--device", help="microphone name or device index")
+    parser.add_argument("--audio-source", choices=("mic", "system", "both"), default="mic",
+                        help="microphone (default), macOS system audio, or both; works with headphones")
+    parser.add_argument("--system-audio-app", action="append", default=[], metavar="BUNDLE_ID",
+                        help="capture playback only from this running app (repeatable; e.g. us.zoom.xos)")
     parser.add_argument("--list-devices", action="store_true", help="list microphone devices and exit")
     parser.add_argument("--sample-rate", type=positive_float, default=None)
     parser.add_argument("--model", default=DEFAULT_MODEL, help="MLX Whisper model repository")
@@ -85,35 +89,84 @@ def session_lock():
             fcntl.flock(file, fcntl.LOCK_UN)
 
 
+class _MicrophoneTap:
+    """The same chunk callback contract as SystemAudioTap, opened on entry only."""
+
+    def __init__(self, sd, device, sr):
+        self.sd, self.device, self.sr = sd, device, sr
+        self.on_chunk = None
+        self.stream = None
+
+    def _callback(self, indata, frames, timing, status):
+        if self.on_chunk is not None:
+            self.on_chunk(indata[:, 0].copy())
+
+    def __enter__(self):
+        self.stream = self.sd.InputStream(device=self.device, channels=1, samplerate=self.sr,
+                                          dtype="float32", callback=self._callback)
+        try:
+            self.stream.__enter__()
+        except BaseException as exc:
+            self.stream.__exit__(type(exc), exc, exc.__traceback__)
+            self.stream = None
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        if self.stream is not None:
+            self.stream.__exit__(*exc)
+            self.stream = None
+        return False
+
+
 def run(args):
     if sys.platform != "darwin":
         raise RuntimeError("Live captions require macOS. File transcription remains available on this platform.")
+    if args.system_audio_app and args.audio_source == "mic":
+        raise ValueError("--system-audio-app requires --audio-source system or both")
+    if args.audio_source != "mic" and args.sample_rate not in (None, 48000):
+        raise ValueError("System audio uses 48000 Hz; omit --sample-rate or set it to 48000")
     if args.demo:
         caption_overlay._require_appkit()
         caption_overlay._run_demo(args.font_size, position=args.captions_position)
         return
-    try:
-        import sounddevice as sd
-    except ImportError:
-        raise RuntimeError("Install microphone support with: pip install 'alwayswhisper[live]'") from None
+    sd = None
+    if args.audio_source != "system" or args.list_devices:
+        try:
+            import sounddevice as sd
+        except ImportError:
+            raise RuntimeError("Install microphone support with: pip install 'alwayswhisper[live]'") from None
     if args.list_devices:
         print(sd.query_devices())
         return
     if platform.machine() != "arm64":
-        raise RuntimeError("Live microphone transcription uses MLX Whisper and requires Apple Silicon.")
+        raise RuntimeError("Live transcription uses MLX Whisper and requires Apple Silicon.")
     if importlib.util.find_spec("mlx_whisper") is None:
         raise RuntimeError("Install local ASR with: pip install 'alwayswhisper[live]'")
     if args.captions:
         caption_overlay._require_appkit()
     device = int(args.device) if args.device and args.device.isdecimal() else args.device
-    info = sd.query_devices(device, "input")
-    sr = int(args.sample_rate or info["default_samplerate"])
+    info = sd.query_devices(device, "input") if args.audio_source != "system" else None
+    sr = int(args.sample_rate or info["default_samplerate"]) if args.audio_source == "mic" else 48000
     prompt = args.glossary.expanduser().read_text(encoding="utf-8").strip() if args.glossary else None
     from .live_transcriber import LiveTranscriber
     with session_lock():
         args.ui_language = resolve_ui_language(args.ui_language)
         directory = resolve_transcript_directory(args.transcript_dir, choose=args.choose_transcript_dir,
                                                  ui_language=args.ui_language)
+        if args.audio_source == "mic":
+            tap = _MicrophoneTap(sd, device, sr)
+            source_name = info["name"]
+        else:
+            from .system_audio import SystemAudioTap
+            factory = (lambda: _MicrophoneTap(sd, device, sr)) if args.audio_source == "both" else None
+            tap = SystemAudioTap(microphone_factory=factory, app_ids=args.system_audio_app)
+            source_name = "内部音声" if args.ui_language == "ja" else "System audio"
+            if factory:
+                source_name += " + " + info["name"]
+            if args.system_audio_app:
+                source_name += " (" + ", ".join(args.system_audio_app) + ")"
+        health_check = getattr(tap, "raise_if_failed", None)
         display_queue = multiprocessing.get_context("spawn").Queue(maxsize=512) if args.captions else None
         transcriber = LiveTranscriber(
             sr, args.model, None if args.language == "auto" else args.language,
@@ -123,13 +176,11 @@ def run(args):
             translate_backend="local",
             async_caption_translation=args.captions and args.async_caption_translation,
         )
-        def callback(indata, frames, timing, status):
-            transcriber.feed(indata[:, 0])
+        tap.on_chunk = transcriber.feed
         try:
-            print_startup(args, directory, info['name'], prompt)
+            print_startup(args, directory, source_name, prompt)
             transcriber.start()
-            with sd.InputStream(device=device, channels=1, samplerate=sr,
-                                dtype="float32", callback=callback):
+            with tap:
                 if args.captions:
                     caption_overlay.run_console_overlay(
                         display_queue, font_size=args.font_size, position=args.captions_position,
@@ -137,9 +188,12 @@ def run(args):
                         translate_backend=args.translate_backend,
                         auto_translate=args.async_caption_translation, language=args.language,
                         language_change=transcriber.set_language, language_source=transcriber.get_language,
+                        health_check=health_check,
                     )
                 else:
                     while True:
+                        if health_check:
+                            health_check()
                         time.sleep(.25)
         except KeyboardInterrupt:
             pass
