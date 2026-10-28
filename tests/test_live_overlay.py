@@ -4154,3 +4154,46 @@ def test_new_utterance_id_starts_row_even_if_eos_was_dropped():
     m.apply(("chunk", "最初", 1), now=0)
     m.apply(("chunk", "次", 2), now=0.1)
     assert m.text_at(0.1) == "次"
+
+
+@pytest.mark.parametrize("position", ["dynamic-island", "bottom"])
+def test_global_fn_toggles_when_hidden_and_unfocused_and_stops_after_close(position):
+    from test_live_input import FakeInput
+    field = FakeInput()
+    mode = co.live_input.LiveInputSession(lambda: field)
+    c = co._OverlayController(None, renderer=_FakeRenderer(), settings_path=None,
+                              position=position, live_input_session=mode)
+    assert not c._panel_visible and not c._hovering
+    c._toggle_live_input_from_fn()
+    assert mode.active
+    mode.feed(("chunk", "まだ入力しない"), fresh=True, current_text="まだ入力しない")
+    c._toggle_live_input_from_fn()
+    mode.flush()
+    assert not mode.active and field.values["a"] == ""  # disabling cancels pending typing
+    c._toggle_live_input_from_fn()
+    assert mode.active
+    c.close()
+    c._toggle_live_input_from_fn()
+    assert not mode.active
+
+
+def test_fn_shortcut_install_and_cleanup_belong_to_controller(monkeypatch):
+    from alwayswhisper.live import fn_shortcut
+    calls, callbacks = [], []
+    class Shortcut:
+        def __init__(self, callback):
+            callbacks.append(callback)
+        def start(self):
+            calls.append("start")
+        def close(self):
+            calls.append("close")
+    monkeypatch.setattr(fn_shortcut, "FnShortcut", Shortcut)
+    c = co._OverlayController(None, renderer=_FakeRenderer(), settings_path=None)
+    # A stand-in panel is enough to exercise installation without native UI.
+    from types import SimpleNamespace
+    c.renderer.panel = SimpleNamespace()
+    c._install_fn_shortcut()
+    assert calls == ["start"]
+    assert callbacks == [c._toggle_live_input_from_fn]
+    c.close()
+    assert calls == ["start", "close"]

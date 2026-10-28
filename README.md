@@ -1160,10 +1160,23 @@ files continue in the same folder and preserve recognized source text; JSONL seg
 record the mode after a change. `--language auto` remains available for automatic
 recognition outside this four-mode cycle.
 
-Click the pencil, or press **L** while the island is active, to toggle Live Input.
+Press and release **Fn / Globe by itself** to toggle Live Input while typing in any
+app. The island does not need to be active, hovered, or visible. Fn combinations
+such as Fn+arrow, Fn+Delete, and Fn+F1 keep their usual behavior and do not toggle
+dictation. Holding Fn does not repeatedly toggle it. The pencil and the island-local
+**L** shortcut remain available.
+
+The Fn shortcut needs macOS Accessibility permission for the terminal/Python app
+launching AlwaysWhisper. If access is missing, a startup message explains how to
+grant it; restart `alwayswhisper live` afterward. If Fn also opens emoji, changes
+input sources, or starts macOS Dictation, set **System Settings → Keyboard →
+Press Fn/Globe key to → Do Nothing**. AlwaysWhisper does not change this OS setting.
+See [Apple's keyboard settings](https://support.apple.com/guide/mac-help/keyboard-settings-kbdm162/mac).
+The shortcut works with floating captions too, and is removed when the overlay
+closes. It is unavailable with `--no-captions`.
+
 It types new text at the caret in the currently focused editable field, without line
-breaks. Turning it on returns focus to your input field. To turn it off by keyboard,
-click the island again and press L. Password fields are excluded; first use requires
+breaks. Turning it on returns focus to your input field. Password fields are excluded; first use requires
 macOS Accessibility/input permission for your terminal or Python app. It stays on
 through idle time and island dismissal, until explicitly toggled off or the app exits.
 While hovered and on, the pencil becomes a repeating `. → .. → ...` indicator.
