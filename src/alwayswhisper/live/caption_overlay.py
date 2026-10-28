@@ -18,7 +18,7 @@ from functools import partial
 from types import SimpleNamespace
 
 from . import translator   # stdlib-only sibling module; safe to import headlessly
-from . import live_input  # AppKit and Accessibility are loaded only after Live Input is enabled
+from . import live_input  # input permission is requested only when Live Input is enabled
 from .transcription_modes import (LANGUAGE_MODES, TRANSLATION_MODES, MODE_LABELS,
                                  MODE_DESCRIPTIONS, next_language_mode)
 
@@ -2558,6 +2558,8 @@ class _OverlayController:
         self._translate_hover_done_text = None
         self._global_mouse_monitor = None
         self._install_global_mouse_monitor()
+        self._fn_shortcut = None
+        self._install_fn_shortcut()
         install_status_item = getattr(self.renderer, "install_status_item", None)
         if install_status_item is not None:
             install_status_item(self.show_from_menu)
@@ -3013,8 +3015,30 @@ class _OverlayController:
             print(f"[caption-overlay] Live Input {'on' if active else 'off'}")
         self._last_state = None
 
+    def _install_fn_shortcut(self):
+        if getattr(self.renderer, "panel", None) is None:
+            return  # headless renderer: no OS keyboard monitoring in unit tests
+        try:
+            from .fn_shortcut import FnShortcut
+            self._fn_shortcut = FnShortcut(self._toggle_live_input_from_fn)
+            self._fn_shortcut.start()
+        except Exception as exc:
+            if self._fn_shortcut is not None:
+                self._fn_shortcut.close()
+                self._fn_shortcut = None
+            print(f"[caption-overlay] Fnショートカットを開始できません: {exc}", file=sys.stderr)
+
+    def _toggle_live_input_from_fn(self):
+        # Global shortcut: no panel visibility, hover or key-window requirement.
+        # Reuse the normal path, including permissions and pending-input reset.
+        if self._closed:
+            return
+        self._toggle_live_input()
+        if not self._live_input.error and not self._debug_input:
+            print(f"[caption-overlay] Live Input {'on' if self._live_input.active else 'off'} (Fn)")
+
     def _handle_key_down(self, event):
-        """Local island shortcuts only; never monitor keys in another input field."""
+        """L/I remain local shortcuts; only a bare Fn tap is global."""
         panel = getattr(self.renderer, "panel", None)
         if (self._closed or not self.geometry.top_anchored or not self._panel_visible
                 or panel is None or not panel.isKeyWindow()):
@@ -3493,6 +3517,9 @@ class _OverlayController:
         `finally` and live_avatar.cmd_menubar's `finally`, i.e. on every
         normal and Ctrl-C teardown path."""
         self._closed = True
+        if self._fn_shortcut is not None:
+            self._fn_shortcut.close()
+            self._fn_shortcut = None
         panel = getattr(self.renderer, "panel", None)
         if panel is not None:
             panel.on_key_down = None
