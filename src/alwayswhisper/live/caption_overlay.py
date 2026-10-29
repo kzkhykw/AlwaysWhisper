@@ -3,6 +3,8 @@
 
 AppKit loads only at runtime. Caption/history/layout logic is safe to import
 without macOS. Start with `alwayswhisper live`; preview with `--demo`.
+The island audio meter is green normally and red while Live Input is enabled.
+Fn toggles Live Input globally; L also works while the island is active.
 """
 import argparse
 import json
@@ -1617,7 +1619,7 @@ def _layout_stack(panel, content, rows, alphas, font_size, geometry, decor=None,
 
     panel_rect, chip_layouts, row_boxes = _compute_layout(
         row_sizes, font_size, decor.hover_row, visible, geometry,
-        scroll_frac=scroll_frac, left_action=not geometry.top_anchored)
+        scroll_frac=scroll_frac, left_action=False)
     panel_x, panel_y, panel_w, panel_h = panel_rect
 
     panel_h += _CONTROL_HEIGHT
@@ -1650,18 +1652,8 @@ def _layout_stack(panel, content, rows, alphas, font_size, geometry, decor=None,
         chip.setAlphaValue_(alpha)
         if geometry.top_anchored:
             chip.background_alpha = 0.0
-        left_reserve = (_icon_reserve_for(font_size)[0] + _PAD_X
-                        if index == decor.hover_row else 0.0)
-        label.setFrame_(AppKit.NSMakeRect(_PAD_X + left_reserve, _PAD_Y, text_w, text_h))
+        label.setFrame_(AppKit.NSMakeRect(_PAD_X, _PAD_Y, text_w, text_h))
         chip.addSubview_(label)
-        if index == decor.hover_row:
-            icon_size = _icon_reserve_for(font_size)[0]
-            pencil_rect = ((left_reserve - icon_size) / 2, (chip_h - icon_size) / 2,
-                           icon_size, icon_size)
-            input_view = _make_live_input_icon_view(
-                pencil_rect, decor.live_input_active, decor.live_input_error)
-            chip.addSubview_(input_view)
-            content.live_input_views.append(input_view)
         if icon_rect is not None:
             icon_view = _make_copy_icon_view(icon_rect, checkmark=(decor.copied_text == text))
             chip.addSubview_(icon_view)
@@ -1807,46 +1799,6 @@ def _make_translate_icon_view(rect, state):
     return _make_icon_view(rect, symbol_name, description, fallback)
 
 
-_LiveInputDotsView = None
-_LIVE_INPUT_DOT_INTERVAL_SEC = 0.4
-
-
-def _make_live_input_dots_view(rect):
-    """Draw fixed-position dots so . → .. → ... never shifts the control."""
-    global _LiveInputDotsView
-    import AppKit
-    if _LiveInputDotsView is None:
-        class _CaptionLiveInputDotsView(AppKit.NSView):
-            def drawRect_(self, dirty):
-                bounds = self.bounds()
-                diameter = min(bounds.size.width, bounds.size.height) * .16
-                step = diameter * 1.9
-                left = (bounds.size.width - diameter - 2 * step) / 2
-                bottom = (bounds.size.height - diameter) / 2
-                AppKit.NSColor.colorWithCalibratedWhite_alpha_(1.0, .9).setFill()
-                for i in range(self.dot_count):
-                    AppKit.NSBezierPath.bezierPathWithOvalInRect_(AppKit.NSMakeRect(
-                        left + i * step, bottom, diameter, diameter)).fill()
-        _LiveInputDotsView = _CaptionLiveInputDotsView
-    view = _LiveInputDotsView.alloc().initWithFrame_(AppKit.NSMakeRect(*rect))
-    view.dot_count = 1
-    return view
-
-
-def _make_live_input_icon_view(rect, active=False, error=False):
-    if error:
-        symbol, label, fallback = "exclamationmark.triangle", "直接入力：権限・入力エラー", "!"
-    elif active:
-        label = "直接入力：オン（クリックでオフ）"
-    else:
-        symbol, label, fallback = "pencil", "直接入力：オフ（クリックでオン）", "✎"
-    view = (_make_live_input_dots_view(rect) if active and not error
-            else _make_icon_view(rect, symbol, label, fallback))
-    view.setToolTip_(label)
-    view.setAccessibilityLabel_(label)
-    return view
-
-
 def _make_language_view(rect, language, pending):
     import AppKit
     label = _make_row_label(10)
@@ -1902,15 +1854,29 @@ class _CaptionStatusItem:
 _AudioMeterView = None
 
 
-def _make_audio_meter_view():
+def _audio_meter_color_name(live_input_active):
+    # Mode must remain legible during silence, not just while bars are moving.
+    return "systemRedColor" if live_input_active else "systemGreenColor"
+
+
+def _set_audio_meter_mode(view, active, error=False):
+    view.live_input_active = bool(active)
+    label = f"音声入力の音量・Live Input：{'オン（赤）' if active else 'オフ（緑）'}（Fnで切り替え）"
+    if error:
+        label += "・権限または入力エラー"
+    view.setToolTip_(label)
+    view.setAccessibilityLabel_(label)
+    view.setNeedsDisplay_(True)
+
+
+def _make_audio_meter_view(active=False, error=False):
     global _AudioMeterView
     import AppKit
     if _AudioMeterView is None:
         class _CaptionAudioMeterView(AppKit.NSView):
             def drawRect_(self, rect):
                 level = getattr(self, "level", 0.0)
-                color = (AppKit.NSColor.systemGreenColor() if level > .02
-                         else AppKit.NSColor.systemGrayColor())
+                color = getattr(AppKit.NSColor, _audio_meter_color_name(self.live_input_active))()
                 color.set()
                 bounds = self.bounds()
                 for x, y, w, h in _audio_bar_rects(level, bounds.size.width, bounds.size.height):
@@ -1919,7 +1885,7 @@ def _make_audio_meter_view():
         _AudioMeterView = _CaptionAudioMeterView
     view = _AudioMeterView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 20, 20))
     view.level = 0.0
-    view.setToolTip_("マイク入力の音量")
+    _set_audio_meter_mode(view, active, error)
     return view
 
 
@@ -2003,12 +1969,8 @@ class _IslandSurface:
                 chip.addSubview_(_make_translate_icon_view(translate_rect, state))
             self.content.addSubview_(chip)
             self.body_views.append((chip, (cx, cy, cw, ch)))
-        self.live_input_control = _make_live_input_icon_view(
-            _island_live_input_rect((0, 0, target[2], target[3]), anchor),
-            decor.live_input_active, decor.live_input_error)
-        self.content.addSubview_(self.live_input_control)
-        self.content.live_input_views = [self.live_input_control]
-        self.content.header_control_views = [self.live_input_control]
+        self.content.live_input_views = []
+        self.content.header_control_views = []
         self.language_view = None
         if decor.language is not None:
             self.language_view = _make_language_view(
@@ -2018,7 +1980,7 @@ class _IslandSurface:
             self.content.header_control_views.append(self.language_view)
         for view in self.content.header_control_views:
             view.setHidden_(not getattr(self.content, "header_controls_visible", False))
-        self.right_status = _make_audio_meter_view()
+        self.right_status = _make_audio_meter_view(decor.live_input_active, decor.live_input_error)
         self.right_status.level = self.audio_level
         self.content.addSubview_(self.right_status)
         self.content.control_views = []
@@ -2081,8 +2043,6 @@ class _IslandSurface:
         wing_width = (w - self.anchor.camera_width) / 2
         inset = max(8.0, min(36.0, (wing_width - 20) / 2))
         sy = h - self.anchor.header_height / 2 - 10
-        self.live_input_control.setFrame_(AppKit.NSMakeRect(
-            *_island_live_input_rect((0, 0, w, h), self.anchor)))
         if self.language_view is not None:
             self.language_view.setFrame_(AppKit.NSMakeRect(
                 *_island_language_rect((0, 0, w, h), self.anchor)))
@@ -2118,25 +2078,14 @@ class _AppKitRenderer:
         self.island = None
         self.audio_timer = None
         self.audio_meter = AudioLevelMeter()
-        self._live_input_started_at = None
 
     def update_live_input_indicator(self, now, active):
-        """Advance only the dots on the existing caption tick; no extra timer/layout."""
-        if not active:
-            self._live_input_started_at = None
-            return
-        if self._live_input_started_at is None:
-            self._live_input_started_at = now
-        count = 1 + int(max(0.0, now - self._live_input_started_at)
-                        / _LIVE_INPUT_DOT_INTERVAL_SEC) % 3
-        changed = False
-        for view in getattr(self.content, "live_input_views", ()):
-            if hasattr(view, "dot_count") and view.dot_count != count:
-                view.dot_count = count
-                view.setNeedsDisplay_(True)
-                changed = True
-        if changed and self.panel.isVisible():
-            self.panel.displayIfNeeded()
+        """Change the existing meter's mode color without affecting its audio level."""
+        view = getattr(self.island, "right_status", None)
+        if view is not None and view.live_input_active != bool(active):
+            _set_audio_meter_mode(view, active)
+            if self.panel.isVisible():
+                self.panel.displayIfNeeded()
 
     def start_audio_meter(self, level_source):
         import AppKit
@@ -2200,13 +2149,7 @@ class _AppKitRenderer:
 
     @property
     def live_input_frame(self):
-        if (self.island is None or not self.panel.isVisible()
-                or self.island.live_input_control.isHidden()):
-            return None
-        frame = self.panel.frame()
-        return _island_live_input_rect(
-            (frame.origin.x, frame.origin.y, frame.size.width, frame.size.height),
-            self.island.anchor)
+        return None  # pencil control removed; no invisible click target remains
 
     @property
     def control_frame(self):
@@ -2992,12 +2935,7 @@ class _OverlayController:
             self._toggle_live_input()
 
     def _hits_live_input(self, point):
-        if not self._panel_visible:
-            return False
-        if self.geometry.top_anchored:
-            rect = getattr(self.renderer, "live_input_frame", None)
-            return rect is not None and _point_in_rect(point, rect)
-        return _hit_live_input_icon(point, self._row_boxes) is not None
+        return False  # Live Input is toggled with Fn / the island-local L key
 
     def _toggle_live_input(self):
         active = self._live_input.toggle()

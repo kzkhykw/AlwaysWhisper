@@ -1178,7 +1178,7 @@ remain cross-platform.
 ### Live Input and language modes
 
 Click the island to make it active, then press **I** to cycle through four modes.
-The language badge and Live Input pencil appear only while hovering over the island.
+The language badge appears only while hovering over the island.
 
 | Badge | Speech → captions / Live Input | Starting flag |
 | --- | --- | --- |
@@ -1196,8 +1196,8 @@ recognition outside this four-mode cycle.
 Press and release **Fn / Globe by itself** to toggle Live Input while typing in any
 app. The island does not need to be active, hovered, or visible. Fn combinations
 such as Fn+arrow, Fn+Delete, and Fn+F1 keep their usual behavior and do not toggle
-dictation. Holding Fn does not repeatedly toggle it. The pencil and the island-local
-**L** shortcut remain available.
+dictation. Holding Fn does not repeatedly toggle it. The island-local **L** shortcut
+also remains available.
 
 The Fn shortcut needs macOS Accessibility permission for the terminal/Python app
 launching AlwaysWhisper. If access is missing, a startup message explains how to
@@ -1212,7 +1212,10 @@ It types new text at the caret in the currently focused editable field, without 
 breaks. Turning it on returns focus to your input field. Password fields are excluded; first use requires
 macOS Accessibility/input permission for your terminal or Python app. It stays on
 through idle time and island dismissal, until explicitly toggled off or the app exits.
-While hovered and on, the pencil becomes a repeating `. → .. → ...` indicator.
+The audio meter at the top right is **red while Live Input is on** and **green while
+it is off**, including during silence. Its bars continue to follow the audio level.
+The pencil button and animated dots have been removed from the island and floating
+captions; use Fn or the island-local L shortcut to toggle Live Input.
 
 In translation modes, **Live Input waits for the translated text** instead of typing
 the original-language preview. Failed or cancelled translations are not inserted.

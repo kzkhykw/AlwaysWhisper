@@ -61,10 +61,10 @@ class MacTextInput:
         ax, quartz = self.ax, self.quartz
         trusted = ax.AXIsProcessTrustedWithOptions({ax.kAXTrustedCheckOptionPrompt: True})
         if not trusted:
-            return False, "macOSのアクセシビリティ権限を許可してから、鉛筆をもう一度押してください"
+            return False, "macOSのアクセシビリティ権限を許可してから、Fnキーをもう一度押してください"
         if not quartz.CGPreflightPostEventAccess():
             quartz.CGRequestPostEventAccess()
-            return False, "macOSの入力操作権限を許可してから、鉛筆をもう一度押してください"
+            return False, "macOSの入力操作権限を許可してから、Fnキーをもう一度押してください"
         return True, None
 
     def _attribute(self, element, name):
