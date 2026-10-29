@@ -93,7 +93,7 @@ app.run()
         wait_text("修正しました追記")
 
         # Exercise the actual island-to-field route: hover makes the panel key,
-        # clicking the pencil must return input to this temporary native field.
+        # Fn must return input to this temporary native field.
         app = AppKit.NSApplication.sharedApplication()
         app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
         session.toggle()
@@ -110,15 +110,11 @@ app.run()
                 AppKit.NSRunLoop.currentRunLoop().runUntilDate_(
                     AppKit.NSDate.dateWithTimeIntervalSinceNow_(.01))
 
-        def click_pencil():
-            rect = controller.renderer.live_input_frame
-            panel = controller.renderer.panel
-            frame = panel.frame()
-            for kind in (AppKit.NSEventTypeLeftMouseDown, AppKit.NSEventTypeLeftMouseUp):
-                event = AppKit.NSEvent.mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure_(
-                    kind, AppKit.NSMakePoint(rect[0] - frame.origin.x + rect[2] / 2,
-                                             rect[1] - frame.origin.y + rect[3] / 2),
-                    0, time.monotonic(), panel.windowNumber(), None, 1, 1, 1.0)
+        def press_fn():
+            for flags in (AppKit.NSEventModifierFlagFunction, 0):
+                event = AppKit.NSEvent.keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode_(
+                    AppKit.NSEventTypeFlagsChanged, AppKit.NSMakePoint(0, 0), flags,
+                    time.monotonic(), controller.renderer.panel.windowNumber(), None, "", "", False, 63)
                 app.postEvent_atStart_(event, False)
             pump(.1)
 
@@ -126,7 +122,7 @@ app.run()
         rect = co._island_live_input_rect(
             (panel_frame.origin.x, panel_frame.origin.y, panel_frame.size.width, panel_frame.size.height),
             controller.renderer.island.anchor)
-        assert controller.renderer.live_input_frame is None  # hidden until hover
+        assert controller.renderer.live_input_frame is None  # pencil has been removed
         # Establish the isolated field as the active app before exercising the
         # panel's temporary focus and return path (AppKit was initialized above).
         AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(process.pid).activateWithOptions_(
@@ -137,7 +133,7 @@ app.run()
         controller.tick()
         pump(.3)
         controller.tick()
-        click_pencil()
+        press_fn()
         assert session.active
         assert not controller.renderer.panel.isKeyWindow()
         assert writer.focused_target() == target, (
@@ -203,7 +199,7 @@ app.run()
             wait_text(expected)
         controller._mouse_location = lambda: (rect[0] + 10, rect[1] + 10)
         controller.tick(); pump(.3); controller.tick()
-        click_pencil()
+        press_fn()
         assert not session.active
         q.put(("chunk", "オフの間は入力しない", 3))
         controller.tick()

@@ -3619,7 +3619,7 @@ def test_docked_body_cannot_arm_move_gesture():
     assert controller._drag_base is None
 
 
-def test_live_input_icon_toggles_without_moving_or_copying():
+def test_removed_live_input_icon_does_not_toggle_and_fn_still_does():
     class FakeLiveInput:
         active = False
         error = None
@@ -3643,9 +3643,12 @@ def test_live_input_icon_toggles_without_moving_or_copying():
         copy_fn=lambda text: copied.append(text) or True)
     controller.tick(now=0)
     controller._mouse_location = lambda: (10, 60)
+    assert not controller._hits_live_input((10, 60))
     controller._handle_mouse_down(None)
-    assert mode.active and not controller._dragging and copied == []
-    controller._handle_mouse_down(None)
+    assert not mode.active and copied == []
+    controller._toggle_live_input_from_fn()
+    assert mode.active
+    controller._toggle_live_input_from_fn()
     assert not mode.active
 
 
@@ -3851,8 +3854,8 @@ def test_island_direct_input_remains_on_through_dismissal_and_idle_until_toggled
                                        position="dynamic-island", live_input_session=mode)
     controller._mouse_location = lambda: (10, 60)
     controller.tick(now=0)
-    # The pencil works before the first caption, without pinning the island.
-    controller._handle_mouse_down(None)
+    # Fn works before the first caption, without pinning the island.
+    controller._toggle_live_input_from_fn()
     assert mode.active and not controller._pinned
     q.put(("chunk", "最初の文。", 1))
     q.put(("eos",))
@@ -3865,7 +3868,7 @@ def test_island_direct_input_remains_on_through_dismissal_and_idle_until_toggled
     q.put(("eos",))
     controller.tick(now=11)
     assert field.values["a"] == "最初の文。次の文。"
-    controller._handle_mouse_down(None)
+    controller._toggle_live_input_from_fn()
     assert not mode.active
     q.put(("chunk", "入力しない", 3))
     controller.tick(now=12)
@@ -4219,3 +4222,24 @@ def test_console_overlay_propagates_audio_failure_and_closes_panel(monkeypatch):
     with pytest.raises(RuntimeError, match="system audio stopped"):
         co.run_console_overlay(None, health_check=failed)
     assert calls == ["stop loop", "invalidate", "close"]
+
+
+def test_live_input_meter_color_changes_without_speech_or_layout():
+    from types import SimpleNamespace
+    labels, redraws = [], []
+    meter = SimpleNamespace(
+        level=0.0, live_input_active=False,
+        setToolTip_=labels.append, setAccessibilityLabel_=labels.append,
+        setNeedsDisplay_=redraws.append)
+    renderer = co._AppKitRenderer.__new__(co._AppKitRenderer)
+    renderer.island = SimpleNamespace(right_status=meter)
+    renderer.panel = SimpleNamespace(isVisible=lambda: False)
+    assert co._audio_meter_color_name(False) == "systemGreenColor"
+    renderer.update_live_input_indicator(0, True)
+    assert co._audio_meter_color_name(meter.live_input_active) == "systemRedColor"
+    assert meter.level == 0.0 and "オン（赤）" in labels[-1]
+    renderer.update_live_input_indicator(1, False)
+    assert co._audio_meter_color_name(meter.live_input_active) == "systemGreenColor"
+    assert meter.level == 0.0 and "オフ（緑）" in labels[-1]
+    assert redraws == [True, True]
+    assert renderer.live_input_frame is None

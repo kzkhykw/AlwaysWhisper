@@ -84,7 +84,7 @@ class FnShortcut:
         if not AX.AXIsProcessTrusted():
             print("[caption-overlay] FnでLive Inputを切り替えるには、macOSのアクセシビリティで"
                   "起動元のターミナル等を許可してalwayswhisper liveを再起動してください。"
-                  "ペンアイコンからも権限を確認できます。", file=sys.stderr)
+                  "アイランドを選択してLキーからも権限を確認できます。", file=sys.stderr)
 
     def _observe(self, event):
         if self._closed:

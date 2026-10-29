@@ -256,8 +256,8 @@ try:
     anchor = surface.anchor
     compact = frame()
     assert abs(compact[1] + compact[3] - anchor.top) < 1
-    assert surface.live_input_control.toolTip() == "直接入力：オフ（クリックでオン）"
-    assert surface.live_input_control.isHidden()
+    assert not surface.right_status.live_input_active
+    assert not hasattr(surface, "live_input_control")
     assert c.renderer.live_input_frame is None
     pencil = co._island_live_input_rect(frame(), anchor)
     assert pencil[0] + pencil[2] <= anchor.center_x - anchor.camera_width / 2
@@ -335,24 +335,20 @@ try:
     c._mouse_location = lambda: (resized[0] + 30,
                                  live_box.frame[1] + live_box.frame[3] / 2)
     c.tick(now=1.2)
-    pencil = c.renderer.live_input_frame
-    post(AppKit.NSEventTypeLeftMouseDown,
-         pencil[0] - resized[0] + pencil[2] / 2,
-         pencil[1] - resized[1] + pencil[3] / 2)
-    pump(.05)
+    c._toggle_live_input_from_fn()
     assert mode.active
     c.tick(now=1.5)
-    assert surface.live_input_control.toolTip() == "直接入力：オン（クリックでオフ）"
-    indicator = surface.live_input_control
-    assert indicator.dot_count == 1
+    indicator = surface.right_status
+    assert indicator.live_input_active
+    assert co._audio_meter_color_name(indicator.live_input_active) == "systemRedColor"
+    assert c.renderer.live_input_frame is None
     capture("direct-input-on")
-    # The existing tick animates just the dots, without rebuilding captions.
+    # Color and level remain stable without rebuilding captions or shifting text.
     body = surface.body_views[0][0]
     stable_frame = frame()
-    for now, count in [(1.91, 2), (2.31, 3), (2.71, 1)]:
+    for now in [1.91, 2.31, 2.71]:
         c.tick(now=now)
-        assert surface.live_input_control is indicator
-        assert indicator.dot_count == count
+        assert surface.right_status is indicator and indicator.live_input_active
         assert surface.body_views[0][0] is body and frame() == stable_frame
     assert c.renderer.control_frame is not None
     c._mouse_location = lambda: (-99999, -99999)
@@ -401,27 +397,19 @@ try:
     assert frame() == compact
     assert c.renderer.panel.isVisible()
     assert mode.active
-    assert surface.live_input_control.isHidden() and c.renderer.live_input_frame is None
-    # Hover reveals the button and expands the last caption.
+    assert not hasattr(surface, "live_input_control") and c.renderer.live_input_frame is None
+    # Hover expands the last caption; Fn toggles without a pencil target.
     c._mouse_location = lambda: (compact[0] + 20, compact[1] + compact[3] / 2)
     c.tick(now=7.05)
     pump(.3)
     c.tick(now=7.06)
-    assert not surface.live_input_control.isHidden()
-    hovered = frame()
-    pencil = c.renderer.live_input_frame
-    post(AppKit.NSEventTypeLeftMouseDown,
-         pencil[0] - hovered[0] + pencil[2] / 2,
-         pencil[1] - hovered[1] + pencil[3] / 2)
-    pump(.05)
+    assert not hasattr(surface, "live_input_control")
+    c._toggle_live_input_from_fn()
     assert not mode.active and not c._pinned
     c.tick(now=7.1)
-    assert not hasattr(surface.live_input_control, "dot_count")
-    assert surface.live_input_control.toolTip() == "直接入力：オフ（クリックでオン）"
-    post(AppKit.NSEventTypeLeftMouseDown,
-         pencil[0] - hovered[0] + pencil[2] / 2,
-         pencil[1] - hovered[1] + pencil[3] / 2)
-    pump(.05)
+    assert not surface.right_status.live_input_active
+    assert co._audio_meter_color_name(surface.right_status.live_input_active) == "systemGreenColor"
+    c._toggle_live_input_from_fn()
     assert mode.active
     # Hover the accessible wing: expands the last caption from the compact shell.
     c._mouse_location = lambda: (compact[0] + 20, compact[1] + compact[3] / 2)
@@ -433,7 +421,7 @@ try:
     pump(.3)
     assert surface.compact and c.renderer.panel.isVisible()
     assert mode.active
-    assert surface.live_input_control.toolTip() == "直接入力：オン（クリックでオフ）"
+    assert surface.right_status.live_input_active
     # Incoming speech interrupts collapse/expansion safely.
     requested = []
     c._language = "ja"
@@ -467,7 +455,7 @@ try:
         q.put(("language", language))
         c.tick(now=8.4)
         assert surface.language_view.stringValue() == label_text
-        assert not surface.language_view.isHidden() and not surface.live_input_control.isHidden()
+        assert not surface.language_view.isHidden() and not hasattr(surface, "live_input_control")
         label = surface.language_view.frame()
         assert surface.language_view.cell().cellSize().width <= label.size.width
         assert frame()[0] + label.origin.x + label.size.width <= anchor.center_x - anchor.camera_width / 2
@@ -476,7 +464,7 @@ try:
     stable = frame(), text_frames()
     c._mouse_location = lambda: (-99999, -99999)
     c.tick(now=8.5)
-    assert surface.language_view.isHidden() and surface.live_input_control.isHidden()
+    assert surface.language_view.isHidden() and not hasattr(surface, "live_input_control")
     assert c.renderer.live_input_frame is None
     assert (frame(), text_frames()) == stable
     capture("header-hidden")
